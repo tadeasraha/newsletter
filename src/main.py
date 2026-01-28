@@ -11,7 +11,6 @@ from src.fetch import fetch_messages_since
 from src.summarize import extract_items_from_message
 from src.filter import load_priority_map, get_priority_for_sender
 import bleach
-import hashlib
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,13 +28,13 @@ ALLOWED_ATTRIBUTES = {
 }
 ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
 
-# UI template (čeština) – interaktivita (JS) pro filtrování a expand/collapse
+# Šablona indexu (čeština) — kompletně uzavřený trojitý string
 INDEX_TEMPLATE = """
 <!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Týdenní přehled (Weekly digest)</title>
+    <title>Týdenní přehled</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
       :root{--bg:#f6f7fb;--card:#fff;--muted:#666;--accent:#1a73e8}
@@ -141,7 +140,7 @@ INDEX_TEMPLATE = """
       {% endfor %}
 
       <footer>
-        Vygenerováno automaticky. Pokud chcete znovu vytvořit shrnutí (re‑summarize), spusť prosím workflow z GitHub Actions.
+        Vygenerováno automaticky. Pokud chcete znovu vytvořit shrnutí (re‑summarize), spusťte workflow z GitHub Actions.
       </footer>
     </div>
 
@@ -174,17 +173,169 @@ INDEX_TEMPLATE = """
     allOpen = !allOpen;
   });
 
-  // highlight open card
   document.querySelectorAll('article.msg details').forEach(d=>{
-    d.addEventListener('toggle', (e)=>{
+    d.addEventListener('toggle', ()=>{
       const el = d.closest('.msg');
       if(d.open) el.classList.add('open'); else el.classList.remove('open');
     });
   });
 
-  // init
   applyFilters();
 })();
 </script>
   </body>
 </html>
+"""
+
+# helpers: cache load/save
+def load_cache(uid: str):
+    p = CACHE_DIR / f"{uid}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+def save_cache(uid: str, data):
+    p = CACHE_DIR / f"{uid}.json"
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to write cache for uid=%s", uid)
+
+def sanitize_html(html_content: str) -> str:
+    return bleach.clean(
+        html_content or "",
+        tags=ALLOWED_TAGS,
+        attributes=ALLOWED_ATTRIBUTES,
+        protocols=ALLOWED_PROTOCOLS,
+        strip=True
+    )
+
+def get_week_window(now: Optional[datetime] = None):
+    # find previous Friday 08:00 (UTC) relative to now
+    now = now or datetime.utcnow().replace(tzinfo=timezone.utc)
+    # weekday(): Monday=0 ... Sunday=6. Friday=4
+    days_ago = (now.weekday() - 4) % 7
+    prev_friday = (now - timedelta(days=days_ago)).replace(hour=8, minute=0, second=0, microsecond=0)
+    if prev_friday > now:
+        prev_friday -= timedelta(days=7)
+    start = prev_friday - timedelta(days=7)
+    end = prev_friday
+    return start, end
+
+def main():
+    IMAP_HOST = os.getenv("IMAP_HOST")
+    IMAP_USER = os.getenv("IMAP_USER")
+    IMAP_PASSWORD = os.getenv("IMAP_PASSWORD")
+
+    if not (IMAP_HOST and IMAP_USER and IMAP_PASSWORD):
+        logger.error("IMAP_HOST/IMAP_USER/IMAP_PASSWORD musí být nastaveny v env")
+        return
+
+    priority_map = load_priority_map(PRIORITY_FILE)
+    if not priority_map:
+        logger.error("Nebyl nalezen priority map: %s", PRIORITY_FILE)
+        return
+    logger.info("Načteno %d záznamů priority", len(priority_map))
+
+    # vyber okno (previous friday 08:00)
+    start_dt, end_dt = get_week_window()
+    logger.info("Fenster: od %s do %s (UTC)", start_dt.isoformat(), end_dt.isoformat())
+
+    msgs = fetch_messages_since(IMAP_HOST, IMAP_USER, IMAP_PASSWORD, start_dt, mailbox="INBOX")
+    logger.info("IMAP: nalezeno kandidátů: %d", len(msgs))
+
+    # dedupe podle message-id (primární) nebo fallback_hash
+    seen_ids = set()
+    unique = []
+    for m in msgs:
+        mid = (m.get("message_id") or "").strip()
+        key = mid if mid else m.get("fallback_hash")
+        if not key:
+            # safety: hash fallback is always present, but guard anyway
+            key = (m.get("fallback_hash") or m.get("uid"))
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        unique.append(m)
+    logger.info("Po deduplikaci unikátních zpráv: %d", len(unique))
+
+    # vyber jen podle priority mapy
+    selected = []
+    for m in unique:
+        pr = get_priority_for_sender(m.get("from", ""), priority_map)
+        if pr is None:
+            continue
+        m["_priority"] = pr
+        # sanitize HTML
+        m["html"] = sanitize_html(m.get("html", ""))
+        # prepare date string
+        m["date"] = m["date"].astimezone(timezone.utc).isoformat()
+        selected.append(m)
+    logger.info("Vybráno podle priority: %d", len(selected))
+
+    # sort strictly by priority (1 highest), tiebreaker: newer first
+    selected_sorted = sorted(selected, key=lambda x: (x.get("_priority", 999), -int(datetime.fromisoformat(x["date"]).timestamp())))
+
+    # summarization + caching (no hard limit)
+    for i, m in enumerate(selected_sorted):
+        uid = m.get("message_id") or m.get("fallback_hash") or m.get("uid")
+        cached = load_cache(uid)
+        if cached is not None:
+            m["_items"] = cached
+            logger.debug("Loaded cache for %s", uid)
+            continue
+        try:
+            items = extract_items_from_message(m.get("subject",""), m.get("from",""), m.get("text",""), m.get("html",""), uid)
+            # filtrovat boilerplate
+            filtered = []
+            for it in items:
+                combined = (it.get("full_text") or "") + " " + (it.get("summary") or "")
+                if re.search(r"(?i)view in browser|unsubscribe|manage your subscription|preferences", combined):
+                    continue
+                filtered.append(it)
+            m["_items"] = filtered
+            save_cache(uid, filtered)
+            logger.info("Summarized uid=%s items=%d", uid, len(filtered))
+        except Exception as e:
+            logger.exception("Summarization failed uid=%s: %s", uid, e)
+            m["_items"] = []
+
+    # Vygenerovat HTML a uložit artifact
+    out_dir = Path("data")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    index_t = Template(INDEX_TEMPLATE)
+    html = index_t.render(messages=selected_sorted)
+    (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
+
+    # také vytvoř per-message pages
+    messages_dir = out_dir / "messages"
+    messages_dir.mkdir(parents=True, exist_ok=True)
+    msg_template = Template("""
+    <!doctype html><html><head><meta charset="utf-8"><title>{{subject}}</title></head><body>
+    <h1>{{subject}}</h1><p><strong>From:</strong> {{frm}} • <strong>Date:</strong> {{date}} • <strong>Priority:</strong> P{{_priority}}</p>
+    <hr><h2>Strukturované položky</h2>
+    {% for it in items %}
+      <details><summary>{{it.title}}{% if it.link %} — <a href="{{it.link}}">odkaz</a>{% endif %}</summary>
+      <p><em>{{it.summary}}</em></p><pre>{{it.full_text}}</pre></details>
+    {% endfor %}
+    <hr><h2>HTML</h2>{{html|safe}}<hr><h2>Plain</h2><pre>{{text}}</pre></body></html>
+    """)
+    for m in selected_sorted:
+        uid = m.get("message_id") or m.get("fallback_hash") or m.get("uid")
+        rendered = msg_template.render(subject=m.get("subject"),
+                                       frm=m.get("from"),
+                                       date=m.get("date"),
+                                       _priority=m.get("_priority"),
+                                       items=m.get("_items", []),
+                                       html=m.get("html", ""),
+                                       text=m.get("text", ""))
+        (messages_dir / f"{uid}.html").write_text(rendered, encoding="utf-8")
+
+    logger.info("Vygenerováno %d zpráv. Digest uložen do data/test_digest.html", len(selected_sorted))
+
+if __name__ == "__main__":
+    main()
