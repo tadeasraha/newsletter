@@ -13,11 +13,15 @@ jobs:
       - name: Show repo files (debug)
         run: |
           pwd
+          echo "Root files:"
           ls -la
+          echo ".github:"
           ls -la .github || true
+          echo ".github/workflows:"
           ls -la .github/workflows || true
-          echo "Python:"
-          python -V
+          echo "requirements.txt exists?"; [ -f requirements.txt ] && echo "YES" || echo "NO"
+          echo "Current Git commit:"; git rev-parse HEAD
+          git log -1 --pretty=oneline
 
       - name: Set up Python
         uses: actions/setup-python@v4
