@@ -1,0 +1,7 @@
+imapclient
+beautifulsoup4
+requests
+readability-lxml
+jinja2
+python-dotenv
+openai
