@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+.env
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Data/state file (do not commit runtime state)
+data/state.json
+
+# Distribution / packaging
+build/
+dist/
