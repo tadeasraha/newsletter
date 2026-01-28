@@ -1,0 +1,40 @@
+# Konfigurace zdrojů newsletterů
+# priority: 1 = nejvyšší důležitost, 3 = nejnižší
+# enabled: true/false
+# folder: složka v IMAP, kde hledat zprávy
+
+sources:
+  - id: "indiehackers"
+    name: "Indie Hackers"
+    from_pattern: "indie-hackers"
+    priority: 1
+    enabled: true
+    folder: "Newslettery"
+
+  - id: "github"
+    name: "GitHub"
+    from_pattern: "github"
+    priority: 2
+    enabled: true
+    folder: "Newslettery"
+
+  - id: "hackernews"
+    name: "Hacker News"
+    from_pattern: "hackernews"
+    priority: 1
+    enabled: true
+    folder: "Newslettery"
+
+  - id: "tldr"
+    name: "TLDR Newsletter"
+    from_pattern: "tldr"
+    priority: 2
+    enabled: true
+    folder: "Newslettery"
+
+  - id: "morning-brew"
+    name: "Morning Brew"
+    from_pattern: "morningbrew"
+    priority: 3
+    enabled: true
+    folder: "Newslettery"
