@@ -1,4 +1,3 @@
-# Minimalní debug workflow pro ověření OpenAI connectivity (nezmění hlavní workflow)
 name: OpenAI debug
 
 on:
