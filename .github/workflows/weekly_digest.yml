@@ -28,13 +28,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies (if requirements.txt exists)
+            - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Debug: check Python & env (no API call)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python -V
+          pip show openai || true
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: OPENAI_API_KEY secret is NOT configured in repo secrets!"
+            exit 1
           else
-            echo "No requirements.txt found — skipping pip install"
+            echo "OPENAI_API_KEY secret appears configured (repo secrets)."
           fi
 
       - name: Run digest (auto-detect entrypoint)
