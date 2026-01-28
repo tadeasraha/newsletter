@@ -19,8 +19,8 @@ PRIORITY_FILE = os.getenv("PRIORITY_FILE", "data/senders_priority.csv")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Bleach config
-ALLOWED_TAGS = bleach.sanitizer.ALLOWED_TAGS + ["img", "details", "summary", "pre"]
+# Bleach config — ALLOWED_TAGS is a frozenset, convert and merge safely
+ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {"img", "details", "summary", "pre"}
 ALLOWED_ATTRIBUTES = {
     **bleach.sanitizer.ALLOWED_ATTRIBUTES,
     "img": ["src", "alt", "title", "width", "height", "loading"],
@@ -207,7 +207,7 @@ def save_cache(uid: str, data):
 def sanitize_html(html_content: str) -> str:
     return bleach.clean(
         html_content or "",
-        tags=ALLOWED_TAGS,
+        tags=list(ALLOWED_TAGS),
         attributes=ALLOWED_ATTRIBUTES,
         protocols=ALLOWED_PROTOCOLS,
         strip=True
@@ -254,7 +254,6 @@ def main():
         mid = (m.get("message_id") or "").strip()
         key = mid if mid else m.get("fallback_hash")
         if not key:
-            # safety: hash fallback is always present, but guard anyway
             key = (m.get("fallback_hash") or m.get("uid"))
         if key in seen_ids:
             continue
