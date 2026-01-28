@@ -1,4 +1,2 @@
 jinja2
-openai
 bleach
-requests
