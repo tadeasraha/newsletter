@@ -3,6 +3,7 @@ import os
 import logging
 import json
 import re
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from jinja2 import Template
@@ -28,11 +29,13 @@ ALLOWED_ATTRIBUTES = {
 ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
 
 INDEX_TEMPLATE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Týdenní digest</title>
+<html><head><meta charset="utf-8"><title>Týdenní výběr newsletterů</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:18px;background:#f6f7fb;color:#111}
 .wrap{max-width:1100px;margin:0 auto}
+.header{margin-bottom:12px}
+.period{color:#666;font-size:0.95rem;margin-bottom:12px}
 .msg{background:#fff;padding:14px;border-radius:10px;margin-bottom:12px;border:1px solid #eaeef6}
 .head{display:flex;justify-content:space-between;align-items:center}
 .meta{color:#666;font-size:0.9rem}
@@ -41,21 +44,24 @@ body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;pa
 button{background:#1a73e8;color:#fff;padding:6px 10px;border-radius:8px;border:none;cursor:pointer}
 .title{font-weight:700}
 a.link{color:#1a73e8}
-</style></head>
-<body>
+.small{font-size:0.9rem;color:#666}
+</style></head><body>
 <div class="wrap">
-<h1>Týdenní digest</h1>
-<p class="meta">Zobrazeny všechny zprávy z priority seznamu za zvolené období. Kliknutím načtěte detail (lazy load).</p>
+  <div class="header">
+    <h1>Týdenní výběr newsletterů</h1>
+    <div class="period">Období: {{ period_start }} — {{ period_end }}</div>
+  </div>
+  <p class="small">Zobrazeny všechny newslettery z vašeho priority seznamu za zvolené období. Kliknutím načtěte rozšířené shrnutí (lazy load).</p>
 {% for m in messages %}
-<article class="msg" id="m-{{ m.uid }}" data-uid="{{ m.uid }}" data-priority="{{ m._priority }}">
+<article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}">
   <div class="head">
     <div>
       <div class="title">{{ m.subject }}{% if m._priority %} (P{{ m._priority }}){% endif %}</div>
       <div class="meta">{{ m.from }} • {{ m.date }}</div>
     </div>
-    <div><a class="link" href="messages/{{ m.uid }}.html" target="_blank">Otevřít celý e‑mail</a></div>
+    <div><a class="link" href="messages/{{ m.safe_id }}.html" target="_blank">Otevřít celý e‑mail</a></div>
   </div>
-  <div class="snippet">{{ m.snippet }}</div>
+  <div class="snippet">{{ m.overview }}</div>
   <div class="detail-container" data-loaded="false">
     <button class="load-detail">Načíst rozšířené shrnutí</button>
   </div>
@@ -119,6 +125,10 @@ a.link{color:#1a73e8}
 </body></html>
 """
 
+# helper functions
+def safe_id_for(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8", errors="ignore")).hexdigest()
+
 def load_cache(uid: str):
     p = CACHE_DIR / f"{uid}.json"
     if p.exists():
@@ -148,12 +158,25 @@ def get_week_window(now: Optional[datetime]=None):
     end = prev_friday
     return start, end
 
+# subject-based exclude patterns (confirmation/verification/subscribe/verify)
+EXCLUDE_SUBJECT_PATTERNS = [
+    r"confirm your subscription", r"confirm subscription", r"confirm email", r"verify your email",
+    r"verification", r"potvrď", r"ověř", r"ověřte", r"confirm", r"verify", r"action required", r"please confirm"
+]
+
+def subject_is_excluded(subject: str) -> bool:
+    s = (subject or "").lower()
+    for p in EXCLUDE_SUBJECT_PATTERNS:
+        if re.search(p, s):
+            return True
+    return False
+
 def main():
     IMAP_HOST = os.getenv("IMAP_HOST")
     IMAP_USER = os.getenv("IMAP_USER")
     IMAP_PASSWORD = os.getenv("IMAP_PASSWORD")
     if not (IMAP_HOST and IMAP_USER and IMAP_PASSWORD):
-        logger.error("IMAP_HOST/IMAP_USER/IMAP_PASSWORD must be set in env")
+        logger.error("IMAP_HOST/IMAP_USER/IMAP_PASSWORD musí být nastaveny v env")
         return
 
     priority_map = load_priority_map(PRIORITY_FILE)
@@ -180,51 +203,59 @@ def main():
 
     selected=[]
     for m in unique:
+        # require newsletter flag (only newsletters) and in priority list
+        if not m.get("is_newsletter"):
+            continue
+        if subject_is_excluded(m.get("subject","")):
+            continue
         pr = get_priority_for_sender(m.get("from",""), priority_map)
         if pr is None: continue
         m["_priority"]=pr
         m["html"] = sanitize_html(m.get("html",""))
         m["date"] = m["date"].astimezone(timezone.utc).isoformat()
-        # snippet: first non-empty line of text or stripped html text
-        snippet = (m.get("text") or "").strip().splitlines()
-        m["snippet"] = snippet[0].strip() if snippet and snippet[0].strip() else (m.get("subject") or "")[:200]
         selected.append(m)
-    logger.info("Selected by priority: %d", len(selected))
+    logger.info("Selected by priority & newsletter filter: %d", len(selected))
 
     selected_sorted = sorted(selected, key=lambda x: (x.get("_priority",999), -int(datetime.fromisoformat(x["date"]).timestamp())))
 
     out_dir = Path("data"); out_dir.mkdir(parents=True, exist_ok=True)
     messages_dir = out_dir / "messages"; messages_dir.mkdir(parents=True, exist_ok=True)
 
-    # summarization and write per-message JSON + HTML
+    # summarization with cache; generate JSON + HTML per message
     for m in selected_sorted:
-        uid = (m.get("message_id") or m.get("fallback_hash") or m.get("uid"))
-        cached = load_cache(uid)
+        raw_id = (m.get("message_id") or m.get("fallback_hash") or m.get("uid"))
+        safe_id = safe_id_for(raw_id)
+        m["safe_id"] = safe_id
+
+        cached = load_cache(safe_id)
         if cached is not None:
-            items = cached
+            summary_obj = cached
         else:
             try:
-                items = extract_items_from_message(m.get("subject",""), m.get("from",""), m.get("text",""), m.get("html",""), uid)
+                summary_obj = extract_items_from_message(m.get("subject",""), m.get("from",""), m.get("text",""), m.get("html",""), safe_id)
                 # filter boilerplate items
-                items = [it for it in items if not re.search(r"(?i)view in browser|unsubscribe|manage your subscription|preferences", (it.get("full_text") or "") + " " + (it.get("summary") or ""))]
+                items = [it for it in summary_obj.get("items", []) if not re.search(r"(?i)view in browser|unsubscribe|manage your subscription|preferences", (it.get("full_text") or "") + " " + (it.get("summary") or ""))]
+                summary_obj["items"] = items
             except Exception as e:
-                logger.exception("Summarize failed uid=%s: %s", uid, e)
-                items = []
-            save_cache(uid, items)
-        m["_items"] = items
+                logger.exception("Summarize failed uid=%s: %s", safe_id, e)
+                summary_obj = {"overview": "", "items": []}
+            save_cache(safe_id, summary_obj)
+
+        m["overview"] = summary_obj.get("overview") or ""
+        m["_items"] = summary_obj.get("items") or []
 
         # write JSON
-        j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": items }
-        (messages_dir / f"{uid}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
+        j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": m["_items"], "overview": m["overview"] }
+        (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
-        # write simple HTML backup page
-        html_template = Template("<!doctype html><html><head><meta charset='utf-8'><title>{{subject}}</title></head><body><h1>{{subject}}</h1><p><strong>From:</strong> {{frm}} • <strong>Date:</strong> {{date}} • <strong>Priority:</strong> P{{_priority}}</p><hr>{% for it in items %}<h3>{{it.title}}</h3><p>{{it.summary}}</p><pre>{{it.full_text}}</pre>{% endfor %}<hr><div>{{html|safe}}</div></body></html>")
-        rendered = html_template.render(subject=m.get("subject"), frm=m.get("from"), date=m.get("date"), _priority=m.get("_priority"), items=items, html=m.get("html",""))
-        (messages_dir / f"{uid}.html").write_text(rendered, encoding="utf-8")
+        # write simple HTML backup
+        html_template = Template("<!doctype html><html><head><meta charset='utf-8'><title>{{subject}}</title></head><body><h1>{{subject}}</h1><p><strong>From:</strong> {{frm}} • <strong>Date:</strong> {{date}} • <strong>Priority:</strong> P{{_priority}}</p><hr><h2>Stručné shrnutí</h2><p>{{overview}}</p><hr>{% for it in items %}<h3>{{it.title}}</h3><p>{{it.summary}}</p><pre>{{it.full_text}}</pre>{% endfor %}<hr><div>{{html|safe}}</div></body></html>")
+        rendered = html_template.render(subject=m.get("subject"), frm=m.get("from"), date=m.get("date"), _priority=m.get("_priority"), items=m["_items"], overview=m["overview"], html=m.get("html",""))
+        (messages_dir / f"{safe_id}.html").write_text(rendered, encoding="utf-8")
 
-    # write index
+    # render index with period
     index_t = Template(INDEX_TEMPLATE)
-    html = index_t.render(messages=selected_sorted)
+    html = index_t.render(messages=selected_sorted, period_start=start_dt.date().isoformat(), period_end=end_dt.date().isoformat())
     (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
     logger.info("Generated %d messages. Digest saved to data/test_digest.html", len(selected_sorted))
 
