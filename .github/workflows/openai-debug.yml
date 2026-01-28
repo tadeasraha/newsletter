@@ -22,16 +22,35 @@ jobs:
 
       - name: Debug: OpenAI minimal test
         env:
-          # mapuje buď secrets.OPENAI_API_KEY nebo secrets.OPENAI_API (fallback)
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPENAI_API }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-3.5-turbo' }}
+          OPENAI_MODEL: gpt-3.5-turbo
         run: |
           set -euo pipefail
           echo "Python $(python -V 2>&1)"
+          pip show openai || true
           if [ -z "${OPENAI_API_KEY:-}" ]; then
             echo "DEBUG: No OpenAI secret provided (OPENAI_API_KEY or OPENAI_API)."
-            echo "DEBUG: Please add the secret in Settings → Secrets and variables → Actions"
             exit 0
           fi
-          echo "DEBUG: OpenAI secret appears present (value is NOT printed). Running minimal test script..."
-          python -u src/openai_test.py
+          python - <<'PY'
+import os,sys
+try:
+    import openai
+except Exception as e:
+    print("PYTHON: import openai failed:", type(e).__name__, str(e)[:300])
+    sys.exit(0)
+openai.api_key = os.getenv("OPENAI_API_KEY")
+model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+try:
+    resp = openai.ChatCompletion.create(
+        model=model,
+        messages=[{"role":"system","content":"You are a test."},{"role":"user","content":"Hello"}],
+        max_tokens=1,
+        temperature=0.0,
+    )
+    print("OPENAI TEST: success; model:", model)
+except Exception as e:
+    ex_type = type(e).__name__
+    ex_msg = str(e).replace("\n"," ")[:300]
+    print(f"OPENAI TEST: failed -> {ex_type}: {ex_msg}")
+PY
