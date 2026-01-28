@@ -1,83 +1,92 @@
-name: Weekly digest (generate, publish, email)
+name: Weekly digest (manual)
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build-and-publish:
+  run-digest:
     runs-on: ubuntu-latest
-    env:
-      OPENAI_MODEL: gpt-3.5-turbo
-      MAX_SUMMARIZED: '999999'
-      PRIORITY_FILE: data/senders_priority.csv
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show repo files (debug)
+        run: |
+          pwd
+          echo "Root files:"
+          ls -la
+          echo ".github:"
+          ls -la .github || true
+          echo ".github/workflows:"
+          ls -la .github/workflows || true
+          echo "requirements.txt exists?"; [ -f requirements.txt ] && echo "YES" || echo "NO"
+          echo "Current Git commit:"; git rev-parse HEAD
+          git log -1 --pretty=oneline
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (if requirements.txt exists)
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Debug: check Python & env (no API call)
-        env:
-          # mapuj existující secret OPENAI_API -> proměnná OPENAI_API_KEY ve skriptech
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API }}
-        run: |
-          python -V
-          pip show openai || true
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "ERROR: OPENAI secret (OPENAI_API) není nakonfigurovaný nebo nebyl namapován."
-            # Nepropadne, jen informuje — můžete změnit na exit 1 pokud chcete fail early.
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
           else
-            echo "OPENAI secret v repo vypadá přítomný (hodnota není vypsána)."
+            echo "No requirements.txt found — skipping pip install"
           fi
 
-      - name: Run weekly digest
+      - name: Run digest (auto-detect entrypoint)
         env:
           IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_PORT: ${{ secrets.IMAP_PORT }}
           IMAP_USER: ${{ secrets.IMAP_USER }}
           IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API }}   # mapujeme pokud se jmenuje OPENAI_API
-          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
-          MAX_SUMMARIZED: ${{ env.MAX_SUMMARIZED }}
-          PRIORITY_FILE: ${{ env.PRIORITY_FILE }}
-        run: |
-          python -u src/main.py
-
-      - name: Upload artifact (data/)
-        uses: actions/upload-artifact@v4
-        with:
-          name: weekly-digest-data
-          path: data
-
-      - name: Deploy to GitHub Pages (publish data/ as site)
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          publish_dir: ./data
-          publish_branch: gh-pages
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Send digest by email (if SMTP secrets present)
-        env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
-          SMTP_RECIPIENTS: ${{ secrets.SMTP_RECIPIENTS }}
+          COMMIT_USER_NAME: ${{ secrets.COMMIT_USER_NAME }}
+          COMMIT_USER_EMAIL: ${{ secrets.COMMIT_USER_EMAIL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          if python -c "import os,sys; print(bool(os.getenv('SMTP_HOST')))" | grep -q True; then
-            python -u src/send_email.py
-          else
-            echo "SMTP credentials not configured; skipping email send."
+          set -euo pipefail
+          echo "Listing project root:" && ls -la
+          # Try common locations and names for a main script
+          CANDIDATES="src/main.py main.py app.py newsletter/main.py"
+          ENTRY=""
+          for p in $CANDIDATES; do
+            if [ -f "$p" ]; then
+              ENTRY="$p"
+              break
+            fi
+          done
+          # Fallback: find any main.py in shallow tree
+          if [ -z "$ENTRY" ]; then
+            ENTRY=$(find . -maxdepth 3 -type f -name 'main.py' | head -n1 || true)
           fi
+          if [ -z "$ENTRY" ]; then
+            echo "No entrypoint found (checked common paths and searched for main.py)."
+            echo "Files at repo root:"
+            ls -la
+            exit 2
+          fi
+          echo "Found entrypoint: $ENTRY"
+          echo "Python sys.path:" && python -c "import sys; print('\\n'.join(sys.path))"
+          # Try running as module (if package layout), else run script directly
+          if python -m src.main >/dev/null 2>&1; then
+            echo "Running as module: python -m src.main"
+            python -m src.main
+          else
+            echo "Running script directly: python $ENTRY"
+            python "$ENTRY"
+          fi
+
+      - name: Upload test digest artifact (if exists)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-digest
+          path: data/test_digest.html
