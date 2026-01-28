@@ -37,7 +37,7 @@ jobs:
             echo "No requirements.txt found — skipping pip install"
           fi
 
-      - name: Run digest
+      - name: Run digest (auto-detect entrypoint)
         env:
           IMAP_HOST: ${{ secrets.IMAP_HOST }}
           IMAP_PORT: ${{ secrets.IMAP_PORT }}
@@ -52,11 +52,37 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           echo "Listing project root:" && ls -la
-          echo "Listing src:" && ls -la src || true
-          echo "Python sys.path:" && python -c "import sys; print('\n'.join(sys.path))"
-          echo "Attempting to run as module 'src.main' (fallback to src/main.py)..."
-          python -m src.main || python src/main.py
+          # Try common locations and names for a main script
+          CANDIDATES="src/main.py main.py app.py newsletter/main.py"
+          ENTRY=""
+          for p in $CANDIDATES; do
+            if [ -f "$p" ]; then
+              ENTRY="$p"
+              break
+            fi
+          done
+          # Fallback: find any main.py in shallow tree
+          if [ -z "$ENTRY" ]; then
+            ENTRY=$(find . -maxdepth 3 -type f -name 'main.py' | head -n1 || true)
+          fi
+          if [ -z "$ENTRY" ]; then
+            echo "No entrypoint found (checked common paths and searched for main.py)."
+            echo "Files at repo root:"
+            ls -la
+            exit 2
+          fi
+          echo "Found entrypoint: $ENTRY"
+          echo "Python sys.path:" && python -c "import sys; print('\\n'.join(sys.path))"
+          # Try running as module (if package layout), else run script directly
+          if python -m src.main >/dev/null 2>&1; then
+            echo "Running as module: python -m src.main"
+            python -m src.main
+          else
+            echo "Running script directly: python $ENTRY"
+            python "$ENTRY"
+          fi
 
       - name: Upload test digest artifact (if exists)
         if: always()
