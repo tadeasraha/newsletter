@@ -50,8 +50,13 @@ jobs:
           COMMIT_USER_NAME: ${{ secrets.COMMIT_USER_NAME }}
           COMMIT_USER_EMAIL: ${{ secrets.COMMIT_USER_EMAIL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m src.main
+          echo "Listing project root:" && ls -la
+          echo "Listing src:" && ls -la src || true
+          echo "Python sys.path:" && python -c "import sys; print('\n'.join(sys.path))"
+          echo "Attempting to run as module 'src.main' (fallback to src/main.py)..."
+          python -m src.main || python src/main.py
 
       - name: Upload test digest artifact (if exists)
         if: always()
