@@ -1,0 +1,46 @@
+name: Weekly digest
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # každý pátek 08:00 CET ≈ 07:00 UTC
+    - cron: '0 7 * * FRI'
+  workflow_dispatch: {}
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+    env:
+      IMAP_HOST: ${{ secrets.IMAP_HOST }}
+      IMAP_PORT: ${{ secrets.IMAP_PORT }}
+      IMAP_USER: ${{ secrets.IMAP_USER }}
+      IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      OPENAI_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPENAI_API }}
+      COMMIT_USER_NAME: ${{ secrets.COMMIT_USER_NAME }}
+      COMMIT_USER_EMAIL: ${{ secrets.COMMIT_USER_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run digest
+        run: python -m src.main
+      - name: Commit state.json (optional)
+        if: always()
+        run: |
+          git config user.name "${{ env.COMMIT_USER_NAME }}"
+          git config user.email "${{ env.COMMIT_USER_EMAIL }}"
+          git add data/state.json || true
+          git commit -m "Update state after digest run" || true
+          git push origin HEAD:${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
