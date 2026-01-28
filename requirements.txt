@@ -1,2 +1,5 @@
 jinja2
 bleach
+beautifulsoup4
+sumy
+nltk
