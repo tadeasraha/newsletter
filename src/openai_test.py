@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-import os, sys, logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+"""
+Minimal OpenAI connectivity test.
+- Reads OPENAI_API_KEY from env.
+- Performs a minimal ChatCompletion call (max_tokens=1).
+- Prints only success or exception type/message (truncated) — never prints the key.
+"""
+import os
+import sys
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+def main():
+    key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    if not key:
+        print("PYTHON: No OPENAI_API_KEY in environment.")
+        return
 
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY is not set in the environment.")
-    sys.exit(2)
+    try:
+        import openai
+    except Exception as e:
+        print("PYTHON: import openai failed:", type(e).__name__, str(e)[:300])
+        return
 
-try:
-    import openai
-except Exception as e:
-    logger.exception("openai package is not installed or import failed: %s", e)
-    sys.exit(3)
+    openai.api_key = key
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role":"system","content":"You are a short test."},{"role":"user","content":"Hello"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+        # if succeeded:
+        print("OPENAI TEST: success; model:", model)
+    except Exception as e:
+        ex_type = type(e).__name__
+        # truncate message to avoid accidental long output
+        ex_msg = str(e).replace("\n", " ")[:500]
+        print(f"OPENAI TEST: failed -> {ex_type}: {ex_msg}")
 
-openai.api_key = OPENAI_API_KEY
-
-try:
-    logger.info("Testing OpenAI connectivity (minimal call to avoid costs)...")
-    resp = openai.ChatCompletion.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":"You are a friendly test."},{"role":"user","content":"Hello"}],
-        max_tokens=1,
-        temperature=0.0,
-    )
-    logger.info("OpenAI call succeeded. Model used: %s", OPENAI_MODEL)
-    sys.exit(0)
-except Exception as e:
-    logger.exception("OpenAI call failed: %s", e)
-    sys.exit(4)
+if __name__ == "__main__":
+    main()
