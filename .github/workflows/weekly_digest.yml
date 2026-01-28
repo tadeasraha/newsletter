@@ -1,4 +1,3 @@
-# Weekly digest: generate, publish and email (validní, s debug krokem)
 name: Weekly digest (generate, publish, email)
 
 on:
