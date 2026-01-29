@@ -4,7 +4,6 @@ Robust generator for newsletter digest.
 
 Behavior:
 - Only include senders present in PRIORITY_FILE (data/senders_priority.csv).
-  Supports exact email matches (user@host) and domain entries (host.com).
 - Always fetch last 7 days (start = now - 7d, end = now).
 - Produce per-message JSON with plain_text and sanitized HTML.
 - Embed base64 plain and base64 sanitized HTML into article attributes (|safe).
@@ -21,10 +20,10 @@ from pathlib import Path
 from jinja2 import Template
 from typing import Optional, Dict, Any, List
 from bs4 import BeautifulSoup
-from email.utils import parsedate_to_datetime, parseaddr
+from email.utils import parsedate_to_datetime
 from src.fetch import fetch_messages_since
 from src.summarize import extract_items_from_message
-from src.filter import load_priority_map
+from src.filter import load_priority_map, get_priority_for_sender
 import bleach
 
 logging.basicConfig(level=logging.INFO)
@@ -357,23 +356,6 @@ def main():
         return
     logger.info("Loaded %d priority entries (file: %s)", len(priority_map), PRIORITY_FILE)
 
-    # Build exact email and domain maps from priority_map (support domain entries)
-    exact_map: Dict[str, int] = {}
-    domain_map: Dict[str, int] = {}
-    for k,v in priority_map.items():
-        kk = (k or "").strip().lower()
-        try:
-            pv = int(v)
-        except Exception:
-            continue
-        if '@' in kk:
-            exact_map[kk] = pv
-        elif kk:
-            # treat as domain entry (e.g. example.com)
-            domain_map[kk] = pv
-
-    logger.info("Priority exact entries: %d, domain entries: %d", len(exact_map), len(domain_map))
-
     # ALWAYS last 7 days up to now
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     start_dt = now - timedelta(days=7)
@@ -400,40 +382,14 @@ def main():
                 continue
             if subject_is_excluded(m.get("subject","")):
                 continue
-
-            # determine sender email and resolve priority:
-            from_header = m.get("from", "") or ""
-            _, sender_email = parseaddr(from_header)
-            sender_email = (sender_email or "").strip().lower()
-            if not sender_email:
-                # can't resolve sender email -> skip
-                logger.debug("Skipping message without sender email: %s", m.get("subject"))
-                continue
-
-            pr = None
-            # exact email match
-            if sender_email in exact_map:
-                pr = exact_map[sender_email]
-            else:
-                # try domain match (e.g. example.com)
-                try:
-                    domain = sender_email.split('@',1)[1]
-                except Exception:
-                    domain = ""
-                if domain and domain in domain_map:
-                    pr = domain_map[domain]
-
+            pr = get_priority_for_sender(m.get("from",""), priority_map)
             if pr is None:
-                # sender not in priority map -> skip (original behavior)
-                logger.debug("Skipping sender not in priority map: %s", sender_email)
+                # original behavior: skip messages whose sender is not in priority map
                 continue
-
             m["_priority"] = int(pr)
-
             raw_html = m.get("html","") or ""
             m["raw_html"] = raw_html
             m["html"] = sanitize_html(raw_html)
-
             dt_val = m.get("date") or m.get("internal_date") or None
             ts = parse_date_to_ts(dt_val)
             if ts == 0:
