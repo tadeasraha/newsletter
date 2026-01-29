@@ -353,7 +353,10 @@ def main():
         (messages_dir / f"{safe_id}.html").write_text(msg_html, encoding="utf-8")
 
     index_t = Template(INDEX_TEMPLATE)
-    html = index_t.render(messages=selected_sorted, period_start=start_dt.date().isoformat(), period_end=end_dt.date().isoformat())
+# zobrazit období ve formátu DD/MM/YYYY (den/měsíc/rok)
+period_start = start_dt.strftime("%d/%m/%Y")
+period_end = end_dt.strftime("%d/%m/%Y")
+html = index_t.render(messages=selected_sorted, period_start=period_start, period_end=period_end)
     (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
     logger.info("Generated %d messages. Digest saved to data/test_digest.html", len(selected_sorted))
 
