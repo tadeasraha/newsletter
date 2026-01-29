@@ -1,5 +1,5 @@
-beautifulsoup4
-sumy
-nltk
-bleach
+beautifulsoup4 
+sumy 
+nltk 
+bleach 
 jinja2
