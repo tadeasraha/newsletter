@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from jinja2 import Template
 from typing import Optional
+from bs4 import BeautifulSoup
 from src.fetch import fetch_messages_since
 from src.summarize import extract_items_from_message
 from src.filter import load_priority_map, get_priority_for_sender
@@ -20,7 +21,7 @@ PRIORITY_FILE = os.getenv("PRIORITY_FILE", "data/senders_priority.csv")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# allow common tags (we will also save raw HTML separately)
+# allow common tags for sanitized HTML (we won't inline raw HTML into index)
 ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {"img", "table", "tr", "td", "th", "thead", "tbody", "tfoot", "style"}
 ALLOWED_ATTRIBUTES = {
     **bleach.sanitizer.ALLOWED_ATTRIBUTES,
@@ -35,33 +36,34 @@ INDEX_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Newsletter Hell 1.0</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:18px;background:#f6f7fb;color:#111}
+body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
 .wrap{max-width:1100px;margin:0 auto}
-.header{margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.header{margin-bottom:28px;display:flex;justify-content:space-between;align-items:center}
 .period{color:#666;font-size:0.95rem;margin-bottom:0}
 .controls{font-size:0.95rem;color:#333}
 .controls label{margin-left:8px;display:inline-flex;align-items:center;gap:6px}
-.msg{background:#fff;padding:12px;border-radius:10px;margin-bottom:12px;border:1px solid #eaeef6}
+.msg{background:#fff;padding:14px;border-radius:10px;margin-bottom:12px;border:1px solid #eaeef6}
 .head{display:flex;justify-content:space-between;align-items:center}
 .meta{color:#666;font-size:0.9rem}
 .title-row{display:flex;align-items:center;gap:10px}
 .snippet{display:none}
 .detail-container{margin-top:8px}
 button{background:#1a73e8;color:#fff;padding:6px 10px;border-radius:8px;border:none;cursor:pointer}
-.title{font-weight:700}
+.title{font-weight:700;font-size:1.05rem}
 a.link{color:#1a73e8}
 .small{font-size:0.9rem;color:#666}
 .prio-square{width:12px;height:12px;display:inline-block;border-radius:2px;vertical-align:middle;margin-left:6px}
 .prio-1{background:#e53935}   /* red */
 .prio-2{background:#fb8c00}   /* orange */
 .prio-3{background:#43a047}   /* green */
-.hidden{display:none}
-iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius:8px}
+.plain-paragraph{margin:10px 0;line-height:1.5;color:#222}
+.header-main{margin-bottom:18px}
+h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 </style></head><body>
 <div class="wrap">
-  <div class="header">
+  <div class="header header-main">
     <div>
-      <h1>Newsletter Hell 1.0</h1>
+      <h1 class="site-title">Newsletter Hell 1.0</h1>
       <div class="period">Období: {{ period_start }} — {{ period_end }}</div>
     </div>
     <div class="controls">
@@ -92,16 +94,84 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
   <div class="detail-container" data-loaded="false"></div>
 </article>
 {% endfor %}
+
 </div>
 
-<script>
-/* PREFETCH contains raw_html for each message; injected server-side */
-window.PREFETCH = {{ prefetch_json | safe }};
+<!-- prefetch JSON inserted as application/json to avoid script-breaking sequences -->
+<script id="prefetch" type="application/json">{{ prefetch_json | safe }}</script>
 
+<script>
 (function(){
+  // parse prefetched JSON safely
+  var PREFETCH = {};
+  try{
+    var el = document.getElementById('prefetch');
+    if(el) PREFETCH = JSON.parse(el.textContent || "{}");
+  } catch(e){
+    console.error("Failed to parse PREFETCH JSON", e);
+    PREFETCH = {};
+  }
+
+  function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"']/g, function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];}); }
+
+  function paragraphizeAndLink(text){
+    // split into paragraphs by double newline or single newline sequences
+    var parts = text.split(/\n{2,}|\r\n{2,}/);
+    var out = '';
+    parts.forEach(function(p){
+      p = p.trim();
+      if(!p) return;
+      // replace placeholders "(odkaz zde: URL)" with anchor
+      p = p.replace(/\(odkaz zde:\s*(https?:\/\/[^\s\)]+)\)/g, function(_, url){
+        return '(<a href="'+escapeHtml(url)+'" target="_blank" rel="noopener noreferrer">odkaz zde</a>)';
+      });
+      out += '<p class="plain-paragraph">' + escapeHtml(p).replace(/\(odkaz zde: (https?:\/\/[^\s\)]+)\)/g, '(odkaz zde)') + '</p>';
+    });
+    return out || '<p class="plain-paragraph">Žádné nové užitečné informace.</p>';
+  }
+
+  // click handler: render plain_text from PREFETCH into DOM (no iframe)
+  document.querySelectorAll('.load-detail').forEach(function(btn){
+    btn.addEventListener('click', function(ev){
+      var container = btn.closest('.detail-container');
+      var article = btn.closest('article.msg');
+      var uid = article && article.getAttribute('data-uid');
+      if(!uid) return;
+      if(container.getAttribute('data-loaded') === 'true'){
+        var details = container.querySelector('.plain-rendered');
+        if(details){
+          var isHidden = details.style.display === 'none';
+          details.style.display = isHidden ? '' : 'none';
+          btn.textContent = isHidden ? 'Sbalit' : 'Rozbalit';
+        }
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Načítám…';
+      try {
+        var data = PREFETCH[uid] || {};
+        var plain = data.plain_text || data.overview || '';
+        // perform minimal fallback: if no plain_text, try items summaries
+        if(!plain && data.items && data.items.length){
+          plain = data.items.map(function(it){ return it.summary || it.full_text || it.title || ''; }).join("\n\n");
+        }
+        var wrapper = document.createElement('div'); wrapper.className = 'plain-rendered';
+        wrapper.innerHTML = paragraphizeAndLink(plain);
+        container.appendChild(wrapper);
+        container.setAttribute('data-loaded','true');
+        btn.textContent = 'Sbalit';
+      } catch(e){
+        console.error(e);
+        btn.textContent = 'Chyba';
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+
+  // priority filter
   function applyPriorityFilter(){
-    var checked = Array.from(document.querySelectorAll('.prio-filter'))
-      .filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
+    var checked = Array.from(document.querySelectorAll('.prio-filter')).filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
     document.querySelectorAll('article.msg').forEach(function(article){
       var p = article.getAttribute('data-priority') || '';
       if(p && checked.indexOf(p) === -1){
@@ -116,57 +186,58 @@ window.PREFETCH = {{ prefetch_json | safe }};
   });
   applyPriorityFilter();
 
-  // on click: create iframe and set srcdoc from PREFETCH.raw_html (no external fetch)
-  document.querySelectorAll('.load-detail').forEach(function(btn){
-    btn.addEventListener('click', function(ev){
-      var container = btn.closest('.detail-container');
-      var article = btn.closest('article.msg');
-      var uid = article.getAttribute('data-uid');
-      if(!uid) return;
-      // toggle if already loaded
-      if(container.getAttribute('data-loaded') === 'true'){
-        var frame = container.querySelector('iframe.msg-frame');
-        if(frame){
-          var isHidden = frame.style.display === 'none';
-          frame.style.display = isHidden ? '' : 'none';
-          btn.textContent = isHidden ? 'Sbalit' : 'Rozbalit';
-        }
-        return;
-      }
-      btn.disabled = true;
-      btn.textContent = 'Načítám…';
-      try {
-        var data = (window.PREFETCH && window.PREFETCH[uid]) || null;
-        var iframe = document.createElement('iframe');
-        iframe.className = 'msg-frame';
-        // Use srcdoc when available (embed HTML directly). Fallback to src if no prefetched HTML.
-        if(data && data.raw_html){
-          iframe.srcdoc = data.raw_html;
-          // show immediately
-          container.appendChild(iframe);
-          btn.textContent = 'Sbalit';
-          btn.disabled = false;
-          container.setAttribute('data-loaded','true');
-        } else {
-          // fallback to loading external file (if present)
-          iframe.src = 'messages/' + uid + '.html';
-          iframe.onload = function(){ btn.disabled = false; btn.textContent = 'Sbalit'; container.setAttribute('data-loaded','true'); };
-          iframe.onerror = function(){ btn.disabled = false; btn.textContent = 'Chyba při načítání'; };
-          container.appendChild(iframe);
-        }
-      } catch(e){
-        console.error(e);
-        btn.textContent = 'Chyba';
-        btn.disabled = false;
-      }
-    });
-  });
 })();
 </script>
 </body></html>
 """
 
 # helper functions
+TECHNICAL_PATTERNS = [
+    r'(?i)nezobrazuje se vám newsletter správně',
+    r'(?i)if you are having trouble viewing this email',
+    r'(?i)click here to view in your browser',
+    r'(?i)zobrazit v prohlížeči',
+    r'(?i)if you can\'t see images',
+    r'(?i)view in browser',
+    r'(?i)local tracking pixel',
+    r'(?i)unsubscribe', r'(?i)odhlásit', r'(?i)manage your subscription', r'(?i)preferences', r'(?i)privacy policy'
+]
+
+URL_RE = re.compile(r'(https?://[^\s\'"<>]+)', re.IGNORECASE)
+
+def _strip_technical(text: str) -> str:
+    t = text or ""
+    for p in TECHNICAL_PATTERNS:
+        t = re.sub(p, '', t)
+    # remove email-like footers and common tiny lines
+    lines = [ln.strip() for ln in t.splitlines()]
+    useful = []
+    for ln in lines:
+        if not ln: continue
+        if len(ln) < 10: 
+            # short lines often signatures or separators; skip
+            continue
+        if re.search(r'(?i)(unsubscribe|odhlásit|preferences|manage your subscription|privacy policy|view in browser|zobrazit v prohlížeči)', ln):
+            continue
+        useful.append(ln)
+    return "\n\n".join(useful).strip()
+
+def html_to_plain_text(html: str, fallback: str = "") -> str:
+    if not html and fallback:
+        t = fallback
+    else:
+        try:
+            t = BeautifulSoup(html or "", "html.parser").get_text(separator="\n")
+        except Exception:
+            t = fallback or ""
+    t = re.sub(r'\r\n', '\n', t)
+    # replace URLs with placeholder format "(odkaz zde: URL)"
+    t = URL_RE.sub(lambda m: f"(odkaz zde: {m.group(1)})", t)
+    t = _strip_technical(t)
+    # collapse multiple blank lines
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    return t
+
 def safe_id_for(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8", errors="ignore")).hexdigest()
 
@@ -187,7 +258,6 @@ def save_cache(uid: str, data):
         logger.exception("Failed to write cache for uid=%s", uid)
 
 def sanitize_html(html_content: str) -> str:
-    # keep common tags but remove script tags to reduce risk
     cleaned = bleach.clean(html_content or "", tags=list(ALLOWED_TAGS), attributes=ALLOWED_ATTRIBUTES, protocols=ALLOWED_PROTOCOLS, strip=True)
     cleaned = re.sub(r'(?is)<script.*?>.*?</script>', '', cleaned)
     cleaned = re.sub(r'javascript:', '', cleaned, flags=re.IGNORECASE)
@@ -205,7 +275,7 @@ def get_week_window(now: Optional[datetime]=None):
 
 EXCLUDE_SUBJECT_PATTERNS = [
     r"confirm your subscription", r"confirm subscription", r"confirm email", r"verify your email",
-    r"verification", r"potvr��", r"ověř", r"ověřte", r"confirm", r"verify", r"action required", r"please confirm"
+    r"verification", r"potvrď", r"ověř", r"ověřte", r"confirm", r"verify", r"action required", r"please confirm"
 ]
 
 def subject_is_excluded(subject: str) -> bool:
@@ -255,7 +325,7 @@ def main():
         if pr is None: continue
         m["_priority"]=pr
         raw_html = m.get("html","") or ""
-        m["raw_html"] = raw_html  # keep raw for srcdoc embed
+        m["raw_html"] = raw_html
         m["html"] = sanitize_html(raw_html)
         try:
             m["date"] = m["date"].astimezone(timezone.utc).isoformat()
@@ -296,7 +366,7 @@ def main():
         j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": m["_items"], "overview": m["overview"] }
         (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
-        # write per-message HTML file (backup)
+        # write per-message HTML file as backup (not inlined into index)
         raw_html = m.get("raw_html") or ""
         if raw_html.strip():
             msg_html = "<!doctype html><html><head><meta charset='utf-8'><title>{}</title></head><body>{}</body></html>".format(
@@ -308,10 +378,12 @@ def main():
             )
         (messages_dir / f"{safe_id}.html").write_text(msg_html, encoding="utf-8")
 
-        # add to prefetch map (embed raw_html for immediate display)
+        # create plain text version (cleaned) for immediate display on Rozbalit
+        plain = html_to_plain_text(raw_html or m.get("text","") or "")
         prefetch_map[safe_id] = {
             "overview": m["overview"] or "",
-            "raw_html": msg_html
+            "plain_text": plain,
+            "items": m["_items"]
         }
 
     # render index (use DD/MM/YYYY format)
