@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Local email extractor + extractive summarizer (no OpenAI).
-Put this file at src/process_email.py and run:
-  python src/process_email.py path/to/email.eml --sentences 4
+Usage: python src/process_email.py path/to/email.eml --sentences 4
 Requires: beautifulsoup4, sumy, nltk
 """
 import argparse
@@ -11,7 +10,6 @@ from email import policy
 from email.parser import BytesParser
 from bs4 import BeautifulSoup
 
-# sumy imports (optional at import-time)
 try:
     from sumy.parsers.plaintext import PlaintextParser
     from sumy.nlp.tokenizers import Tokenizer
@@ -78,7 +76,6 @@ def normalize_whitespace(text):
     return text.strip()
 
 def replace_links_with_placeholder(text):
-    # Replace URLs with placeholder "(odkaz zde: URL)" so frontend can render anchor if desired
     def repl(m):
         url = m.group(1)
         return f' (odkaz zde: {url})'
@@ -110,9 +107,7 @@ def extractive_summary(text, sentences_count=3, language="czech"):
 def to_safe_paragraphs(sentences):
     paragraphs = []
     for s in sentences:
-        # convert "(odkaz zde: URL)" to an inline anchor representation
         s = re.sub(r'\(odkaz zde:\s*(https?://[^\s\)]+)\)', r'(<a href="\1" target="_blank" rel="noopener noreferrer">odkaz zde</a>)', s)
-        # minimal escaping: remove control chars that might break HTML view
         s = s.replace("\r", "").strip()
         paragraphs.append(f'<p>{s}</p>')
     return "\n".join(paragraphs)
@@ -131,7 +126,6 @@ def process_file(path, sentences=4, language="czech"):
     try:
         useful = extractive_summary(cleaned, sentences_count=sentences, language=language)
     except Exception:
-        # fallback: first N non-empty sentences
         sents = re.split(r'(?<=[.!?])\s+', cleaned.strip())
         useful = [x for x in sents if len(x.strip())>30][:sentences]
     if not useful:
