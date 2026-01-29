@@ -72,33 +72,26 @@ a.link{color:#1a73e8}
 </div>
 
 <script>
-/*
-  PREFETCH map is injected server-side as JSON. It contains:
-    { "<safe_id>": { "overview": "...", "items": [ {title,summary,full_text,link}, ... ] }, ... }
-  Client simply uses PREFETCH — no network calls required.
-*/
+/* PREFETCH is injected by server-side rendering as JSON */
 window.PREFETCH = {{ prefetch_json | safe }};
 
 (function(){
   function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"']/g, function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
 
   function renderItemHtml(it){
-    // produce safe HTML: each new information in its own <p>
     var out = '';
     var summary = (it.summary || '').trim();
     if(summary){
-      // split into sentences/lines to ensure separate paragraphs for distinct infos
+      // split by sentences or newlines to create separate paragraphs
       var parts = summary.split(/(?<=[.!?])\s+|\n+/);
       for(var i=0;i<parts.length;i++){
         var p = parts[i].trim();
         if(!p) continue;
-        // remove obvious technical boilerplate occurrences (lowercased check)
         var low = p.toLowerCase();
         if(low.indexOf('nezobrazuje se vám')!==-1 || low.indexOf('view in browser')!==-1 || low.indexOf('unsubscribe')!==-1) continue;
         out += '<p>'+escapeHtml(p)+'</p>';
       }
     }
-    // If link present, append a parenthetical anchor as requested
     if(it.link){
       out += '<p>(<a href="'+escapeHtml(it.link)+'" target="_blank" rel="noopener noreferrer">odkaz zde</a>)</p>';
     }
@@ -116,7 +109,6 @@ window.PREFETCH = {{ prefetch_json | safe }};
         return;
       }
       var data = window.PREFETCH[uid] || {overview:'', items:[]};
-      // Toggle: if already rendered, show/hide
       if(container.getAttribute('data-loaded')==='true'){
         var details = container.querySelector('.details-rendered');
         if(details){
@@ -127,7 +119,6 @@ window.PREFETCH = {{ prefetch_json | safe }};
         return;
       }
 
-      // Build details from PREFETCH (no network)
       btn.disabled = true;
       btn.textContent = 'Načítám…';
       try{
@@ -137,19 +128,16 @@ window.PREFETCH = {{ prefetch_json | safe }};
           wrapper.innerHTML = '<p>Žádné nové užitečné informace.</p>';
         } else {
           items.forEach(function(it, idx){
-            // header: title + short summary inline
             var sec = document.createElement('details');
             var summ = document.createElement('summary');
-            summ.innerHTML = '<strong>'+escapeHtml(it.title || '')+'</strong> — <span style="color:#444">'+escapeHtml(it.summary || '').slice(0,200)+'</span>';
+            summ.innerHTML = '<strong>'+escapeHtml(it.title || '')+'</strong> — <span style="color:#444">'+escapeHtml((it.summary||'').slice(0,200))+'</span>';
             sec.appendChild(summ);
 
             var content = document.createElement('div'); content.style.padding='8px 0';
             var full = document.createElement('div'); full.className='full-text hidden'; full.style.marginTop='8px'; full.style.borderTop='1px solid #eee'; full.style.paddingTop='8px';
-            // build paragraphs for summary and full_text (preferring summary)
             full.innerHTML = renderItemHtml(it);
             content.appendChild(full);
 
-            // add a small toggle link to show full
             var linkDiv = document.createElement('div'); linkDiv.style.marginTop='8px';
             var a = document.createElement('a'); a.href='#'; a.textContent = 'Zobrazit celý text';
             a.style.cursor = 'pointer';
@@ -210,7 +198,6 @@ def get_week_window(now: Optional[datetime]=None):
     end = prev_friday
     return start, end
 
-# subject-based exclude patterns (confirmation/verification/subscribe/verify)
 EXCLUDE_SUBJECT_PATTERNS = [
     r"confirm your subscription", r"confirm subscription", r"confirm email", r"verify your email",
     r"verification", r"potvrď", r"ověř", r"ověřte", r"confirm", r"verify", r"action required", r"please confirm"
@@ -255,7 +242,6 @@ def main():
 
     selected=[]
     for m in unique:
-        # require newsletter flag (only newsletters) and in priority list
         if not m.get("is_newsletter"):
             continue
         if subject_is_excluded(m.get("subject","")):
@@ -273,10 +259,8 @@ def main():
     out_dir = Path("data"); out_dir.mkdir(parents=True, exist_ok=True)
     messages_dir = out_dir / "messages"; messages_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build PREFETCH map (safe JSON serializable)
     prefetch_map = {}
 
-    # summarization with cache; generate JSON + HTML per message
     for m in selected_sorted:
         raw_id = (m.get("message_id") or m.get("fallback_hash") or m.get("uid"))
         safe_id = safe_id_for(raw_id)
@@ -288,7 +272,6 @@ def main():
         else:
             try:
                 summary_obj = extract_items_from_message(m.get("subject",""), m.get("from",""), m.get("text",""), m.get("html",""), safe_id)
-                # filter boilerplate items
                 items = [it for it in summary_obj.get("items", []) if not re.search(r"(?i)view in browser|unsubscribe|manage your subscription|preferences", (it.get("full_text") or "") + " " + (it.get("summary") or ""))]
                 summary_obj["items"] = items
             except Exception as e:
@@ -299,16 +282,13 @@ def main():
         m["overview"] = summary_obj.get("overview") or ""
         m["_items"] = summary_obj.get("items") or []
 
-        # write JSON (per-message)
         j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": m["_items"], "overview": m["overview"] }
         (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
-        # write simple HTML backup
         html_template = Template("<!doctype html><html><head><meta charset='utf-8'><title>{{subject}}</title></head><body><h1>{{subject}}</h1><p><strong>From:</strong> {{frm}} • <strong>Date:</strong> {{date}} • <strong>Priority:</strong> P{{_priority}}</p><hr><h2>Stručné shrnutí</h2>{% for it in items %}<h3>{{it.title}}</h3>{% for p in it.summary.split('\\n') %}<p>{{p}}</p>{% endfor %}<pre>{{it.full_text}}</pre>{% endfor %}<hr><div>{{html|safe}}</div></body></html>")
-        rendered = html_template.render(subject=m.get("subject"), frm=m.get("from"), date=m.get("date"), _priority=m[" _priority"] if False else m.get("_priority"), items=m["_items"], overview=m["overview"], html=m.get("html",""))
+        rendered = html_template.render(subject=m.get("subject"), frm=m.get("from"), date=m.get("date"), _priority=m.get("_priority"), items=m["_items"], overview=m["overview"], html=m.get("html",""))
         (messages_dir / f"{safe_id}.html").write_text(rendered, encoding="utf-8")
 
-        # Add to PREFETCH map (ensure simple data)
         safe_items = []
         for it in m["_items"]:
             safe_items.append({
@@ -319,7 +299,6 @@ def main():
             })
         prefetch_map[safe_id] = {"overview": m["overview"] or "", "items": safe_items}
 
-    # render index with period and PREFETCH JSON embedded
     index_t = Template(INDEX_TEMPLATE)
     prefetch_json = json.dumps(prefetch_map, ensure_ascii=False)
     html = index_t.render(messages=selected_sorted, period_start=start_dt.date().isoformat(), period_end=end_dt.date().isoformat(), prefetch_json=prefetch_json)
