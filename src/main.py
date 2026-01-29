@@ -7,7 +7,7 @@ import hashlib
 import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from jinja2 import Template
+from jinja2 import Environment, select_autoescape
 from typing import Optional
 from bs4 import BeautifulSoup
 from src.fetch import fetch_messages_since
@@ -371,7 +371,8 @@ def main():
     # render index (use DD/MM/YYYY format)
     period_start = start_dt.strftime("%d/%m/%Y")
     period_end = end_dt.strftime("%d/%m/%Y")
-    index_t = Template(INDEX_TEMPLATE)
+    env = Environment(autoescape=select_autoescape(default=True))
+    index_t = env.from_string(INDEX_TEMPLATE)
     html = index_t.render(messages=selected_sorted, period_start=period_start, period_end=period_end)
     (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
     logger.info("Generated %d messages. Digest saved to data/test_digest.html", len(selected_sorted))
