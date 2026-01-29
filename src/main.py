@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-Generator digestu (upravený) — zobrazování jako pěkný plain‑text rendering.
+Generator digestu — fokus: čitelný plain-text preview + strict priority filtering.
 
-Hlavní body:
-- Pouze odesílatelé uvedení v data/senders_priority.csv budou zahrnuti (původní chování).
-- Vždy vezme posledních 7 dní (start = now - 7d, end = now).
-- Pro každý message vygeneruje:
-  - plain text (plain) - očištěný
-  - plain_render_html - HTML reprezentaci přeformátovaného plain textu (paragrafy, zalomení) pro čitelné zobrazení
-  - plain_b64, plain_render_b64, plain_html_b64 (base64) -> vloženo do atributů article bez Jinja escaping (|safe)
-  - messages/<uid>.json bude obsahovat plain_text i plain_html a plain_render (fallback)
-- Klient: po kliknutí na nadpis použije nejprve plain_render (hezčí čitelný plain text v HTML), pak sanitized HTML, pak jednoduchý plain text, pak fetch JSON.
-- Eventy se připojují v DOMContentLoaded; priority filtering funguje podle atributu data-priority.
-
-Poznámka: Tento soubor nahraď src/main.py ve větvi pro testování; otestuj lokálně (návod níže).
+- Only include senders listed in data/senders_priority.csv (error and exit if missing/empty).
+- Window always last 7 days (now - 7d .. now).
+- For each message produce: plain_text, plain_render_html (wrapped readable HTML), plain_html (sanitized original HTML).
+- Embed base64 variants into <article> attributes (Jinja |safe).
+- Client tries: plain_render_html -> plain_html -> plain_text -> messages/<uid>.json.
+- Robust base64 -> UTF-8 decoding using TextDecoder where available.
 """
 import os
 import logging
@@ -40,25 +34,25 @@ PRIORITY_FILE = os.getenv("PRIORITY_FILE", "data/senders_priority.csv")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Rozšířené povolené tagy pro sanitizované HTML (kdybychom ho zobrazovali)
+# Allowed tags/attrs for sanitized HTML (server-side bleach)
 ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
-    "img", "table", "tr", "td", "th", "thead", "tbody", "tfoot", "style",
-    "p", "br", "h1", "h2", "h3", "strong", "b", "em", "i", "ul", "ol", "li", "blockquote"
+    "img","table","tr","td","th","thead","tbody","tfoot","style",
+    "p","br","h1","h2","h3","strong","b","em","i","ul","ol","li","blockquote"
 }
 ALLOWED_ATTRIBUTES = {
     **bleach.sanitizer.ALLOWED_ATTRIBUTES,
-    "img": ["src", "alt", "title", "width", "height", "loading"],
-    "a": ["href", "title", "rel", "target"],
-    "td": ["colspan", "rowspan"],
-    "th": ["colspan", "rowspan"],
+    "img": ["src","alt","title","width","height","loading"],
+    "a": ["href","title","rel","target"],
+    "td": ["colspan","rowspan"],
+    "th": ["colspan","rowspan"],
 }
-ALLOWED_PROTOCOLS = ["http", "https", "mailto", "data"]
+ALLOWED_PROTOCOLS = ["http","https","mailto","data"]
 
 INDEX_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Newsletter Hell</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
 .wrap{max-width:1100px;margin:0 auto}
 .header{margin-bottom:28px;display:flex;justify-content:space-between;align-items:center}
 .period{color:#666;font-size:0.95rem;margin-bottom:0}
@@ -82,6 +76,7 @@ a.link{color:#1a73e8}
 .msg-html img{max-width:100%;height:auto}
 .header-main{margin-bottom:18px}
 h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
+.debug-small{font-size:0.8rem;color:#999;margin-left:8px}
 </style></head><body>
 <div class="wrap">
   <div class="header header-main">
@@ -108,7 +103,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
           <span class="prio-square prio-{{ m._priority }}" title="Priority P{{ m._priority }}"></span>
         {% endif %}
       </div>
-      <div class="meta">{{ m.from }} • {{ m.date }}</div>
+      <div class="meta">{{ m.from }} • {{ m.date }} <span class="debug-small">uid: {{ m.safe_id[:8] }}</span></div>
     </div>
     <div style="display:flex;gap:8px;align-items:center"></div>
   </div>
@@ -122,7 +117,32 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 (function(){
   function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"']/g, function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];}); }
 
-  // Render order: plain_render (formatted plain-text HTML) -> sanitized HTML -> simple plain text -> JSON fallback
+  function base64ToUtf8(b64){
+    if(!b64) return null;
+    // unescape HTML-escaped base64 if needed
+    if(b64.indexOf('&') !== -1){
+      try { var ta = document.createElement('textarea'); ta.innerHTML = b64; b64 = ta.value; } catch(e){ /* ignore */ }
+    }
+    try {
+      var bin = atob(b64);
+    } catch(e){
+      return null;
+    }
+    // decode UTF-8 bytes -> string
+    try {
+      if(typeof TextDecoder !== 'undefined'){
+        var arr = new Uint8Array(bin.length);
+        for(var i=0;i<bin.length;i++){ arr[i]=bin.charCodeAt(i); }
+        return new TextDecoder().decode(arr);
+      } else {
+        // fallback
+        try { return decodeURIComponent(escape(bin)); } catch(e){ return bin; }
+      }
+    } catch(e){
+      try { return decodeURIComponent(escape(bin)); } catch(e){ return bin; }
+    }
+  }
+
   function renderPlainForArticle(article){
     var container = article.querySelector('.detail-container');
     if(!container) return;
@@ -136,53 +156,35 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       return;
     }
 
-    // 1) try formatted plain render (preferred for readability)
+    // 1) formatted plain render HTML (preferred)
     var renderB64 = article.getAttribute('data-plain-render') || '';
-    if(renderB64){
-      if(renderB64.indexOf('&') !== -1){
-        try { var taR = document.createElement('textarea'); taR.innerHTML = renderB64; renderB64 = taR.value; } catch(e){ console.warn('unescape render_b64 failed', e); }
-      }
-      try {
-        var renderHtml = decodeURIComponent(escape(window.atob(renderB64)));
-        var wrapper = document.createElement('div');
-        wrapper.className = 'plain-rendered msg-html';
-        wrapper.innerHTML = renderHtml;
-        container.appendChild(wrapper);
-        container.setAttribute('data-loaded','true');
-        return;
-      } catch(e){
-        console.warn('render_b64 decode failed', e);
-      }
+    var renderHtml = base64ToUtf8(renderB64);
+    if(renderHtml){
+      var wrapper = document.createElement('div');
+      wrapper.className = 'plain-rendered msg-html';
+      wrapper.innerHTML = renderHtml;
+      container.appendChild(wrapper);
+      container.setAttribute('data-loaded','true');
+      console.log('rendered plain_render_html for', article.getAttribute('data-uid'));
+      return;
     }
 
-    // 2) try sanitized HTML (server sanitized)
+    // 2) sanitized HTML (server-side sanitized)
     var htmlB64 = article.getAttribute('data-plain-html') || '';
-    if(htmlB64){
-      if(htmlB64.indexOf('&') !== -1){
-        try { var ta2 = document.createElement('textarea'); ta2.innerHTML = htmlB64; htmlB64 = ta2.value; } catch(e){ console.warn('unescape html_b64 failed', e); }
-      }
-      try {
-        var htmlDecoded = decodeURIComponent(escape(window.atob(htmlB64)));
-        var wrapperHtml = document.createElement('div');
-        wrapperHtml.className = 'plain-rendered msg-html';
-        wrapperHtml.innerHTML = htmlDecoded;
-        container.appendChild(wrapperHtml);
-        container.setAttribute('data-loaded','true');
-        return;
-      } catch(e){
-        console.warn('html base64 decode failed', e);
-      }
+    var htmlDecoded = base64ToUtf8(htmlB64);
+    if(htmlDecoded){
+      var wrapperHtml = document.createElement('div');
+      wrapperHtml.className = 'plain-rendered msg-html';
+      wrapperHtml.innerHTML = htmlDecoded;
+      container.appendChild(wrapperHtml);
+      container.setAttribute('data-loaded','true');
+      console.log('rendered plain_html for', article.getAttribute('data-uid'));
+      return;
     }
 
-    // 3) try simple plain text
+    // 3) simple plain text
     var b64 = article.getAttribute('data-plain') || '';
-    if(b64 && b64.indexOf('&') !== -1){
-      try { var ta = document.createElement('textarea'); ta.innerHTML = b64; b64 = ta.value; } catch(e){ console.warn('unescape failed', e); }
-    }
-    var plain = '';
-    if(b64){
-      try { plain = decodeURIComponent(escape(window.atob(b64))); } catch(e){ plain = ''; }
-    }
+    var plain = base64ToUtf8(b64);
     if(plain){
       var parts = plain.split(/\n{2,}|\r\n{2,}/).map(function(p){ return p.trim(); }).filter(Boolean);
       var wrapper = document.createElement('div'); wrapper.className = 'plain-rendered';
@@ -193,6 +195,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       }
       container.appendChild(wrapper);
       container.setAttribute('data-loaded','true');
+      console.log('rendered plain_text for', article.getAttribute('data-uid'));
       return;
     }
 
@@ -200,6 +203,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
     var uid = article.getAttribute('data-uid');
     if(!uid) return;
     var url = 'messages/' + uid + '.json';
+    console.log('fetch fallback JSON', url);
     fetch(url).then(function(resp){
       if(!resp.ok) throw new Error('HTTP '+resp.status);
       return resp.json();
@@ -253,7 +257,10 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 
   function applyPriorityFilter(){
     var checked = Array.from(document.querySelectorAll('.prio-filter')).filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
-    document.querySelectorAll('article.msg').forEach(function(article){
+    console.log('applyPriorityFilter: checked', checked);
+    var articles = document.querySelectorAll('article.msg');
+    console.log('applyPriorityFilter: articles count', articles.length);
+    articles.forEach(function(article){
       var p = article.getAttribute('data-priority') || '';
       if(p && checked.indexOf(p) === -1){
         article.style.display = 'none';
@@ -263,19 +270,27 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
     });
   }
 
-  document.addEventListener('DOMContentLoaded', function(){
+  function init(){
     attachTitleHandlers();
     document.querySelectorAll('.prio-filter').forEach(function(cb){
       cb.addEventListener('change', applyPriorityFilter);
     });
     applyPriorityFilter();
-  });
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
 })();
 </script>
 </body></html>
 """
 
-# helpers and processing logic
+# ---- helpers and processing logic below ----
+
 TECHNICAL_PATTERNS = [
     r'(?i)nezobrazuje se vám newsletter správně',
     r'(?i)if you are having trouble viewing this email',
@@ -304,10 +319,6 @@ def _strip_technical(text: str) -> str:
     return "\n\n".join(useful).strip()
 
 def html_to_plain_text(html: str, fallback: str = "") -> str:
-    """
-    Extract readable plain text: use BeautifulSoup get_text with paragraph separators,
-    then strip technical boilerplate and collapse excess blank lines.
-    """
     if not html and fallback:
         t = fallback
     else:
@@ -322,10 +333,6 @@ def html_to_plain_text(html: str, fallback: str = "") -> str:
     return t
 
 def format_plain_for_display(plain_text: str, width: int = 84) -> str:
-    """
-    Convert plain_text into HTML with paragraphs and wrapped lines for readability.
-    Returns HTML string (safe to insert as innerHTML after escaping).
-    """
     if not plain_text:
         return '<div class="msg-html"><p class="plain-paragraph">Žádné nové užitečné informace.</p></div>'
     parts = re.split(r'\n{2,}|\r\n{2,}', plain_text)
@@ -334,21 +341,13 @@ def format_plain_for_display(plain_text: str, width: int = 84) -> str:
         p = p.strip()
         if not p:
             continue
-        # collapse single newlines inside a paragraph into spaces
         p = re.sub(r'\n+', ' ', p)
         p = re.sub(r'[ \t]{2,}', ' ', p)
-        # wrap text to given width for easier reading in fixed container
         try:
             wrapped = textwrap.fill(p, width=width)
         except Exception:
             wrapped = p
-        # escape HTML entities (we will render inside <p>)
-        esc = (wrapped
-               .replace('&', '&amp;')
-               .replace('<', '&lt;')
-               .replace('>', '&gt;')
-               .replace('"', '&quot;')
-               .replace("'", '&#39;'))
+        esc = (wrapped.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&#39;'))
         out_parts.append(f'<p class="plain-paragraph">{esc}</p>')
     return '<div class="msg-html">' + ''.join(out_parts) + '</div>'
 
