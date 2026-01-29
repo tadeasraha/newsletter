@@ -29,7 +29,7 @@ ALLOWED_ATTRIBUTES = {
 ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
 
 INDEX_TEMPLATE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Newsletter</title>
+<html><head><meta charset="utf-8"><title>Newsletter Hell 1.0</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:18px;background:#f6f7fb;color:#111}
@@ -45,13 +45,15 @@ button{background:#1a73e8;color:#fff;padding:6px 10px;border-radius:8px;border:n
 .title{font-weight:700}
 a.link{color:#1a73e8}
 .small{font-size:0.9rem;color:#666}
+.details-rendered p{margin:8px 0}
+.hidden{display:none}
 </style></head><body>
 <div class="wrap">
   <div class="header">
     <h1>Newsletter Hell 1.0</h1>
     <div class="period">Období: {{ period_start }} — {{ period_end }}</div>
   </div>
-    <p class="small">Zobrazeny všechny newslettery z uvedeného týdne. Klikni na <strong>Rozbalit</strong> pro zobrazení shrnutí.</p>
+  <p class="small">Zobrazeny všechny newslettery z uvedeného týdne. Shrnutí jsou přednačtená — klikni na <strong>Rozbalit</strong> u příslušného newsletteru pro zobrazení shrnutí.</p>
 {% for m in messages %}
 <article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}">
   <div class="head">
@@ -63,61 +65,111 @@ a.link{color:#1a73e8}
   </div>
   <div class="snippet">{{ m.overview }}</div>
   <div class="detail-container" data-loaded="false">
-    <button class="load-detail">Načíst rozšířené shrnutí</button>
+    <button class="load-detail">Rozbalit</button>
   </div>
 </article>
 {% endfor %}
 </div>
+
 <script>
+/*
+  PREFETCH map is injected server-side as JSON. It contains:
+    { "<safe_id>": { "overview": "...", "items": [ {title,summary,full_text,link}, ... ] }, ... }
+  Client simply uses PREFETCH — no network calls required.
+*/
+window.PREFETCH = {{ prefetch_json | safe }};
+
 (function(){
   function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"']/g, function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
-  function renderFullTextHtml(full_text, link){
-    let out = '';
-    if(link){ out += '<p><a href="'+escapeHtml(link)+'" target="_blank">'+escapeHtml(link)+'</a></p>'; }
-    out += '<pre style="white-space:pre-wrap;">'+escapeHtml(full_text||'')+'</pre>';
-    return out;
+
+  function renderItemHtml(it){
+    // produce safe HTML: each new information in its own <p>
+    var out = '';
+    var summary = (it.summary || '').trim();
+    if(summary){
+      // split into sentences/lines to ensure separate paragraphs for distinct infos
+      var parts = summary.split(/(?<=[.!?])\s+|\n+/);
+      for(var i=0;i<parts.length;i++){
+        var p = parts[i].trim();
+        if(!p) continue;
+        // remove obvious technical boilerplate occurrences (lowercased check)
+        var low = p.toLowerCase();
+        if(low.indexOf('nezobrazuje se vám')!==-1 || low.indexOf('view in browser')!==-1 || low.indexOf('unsubscribe')!==-1) continue;
+        out += '<p>'+escapeHtml(p)+'</p>';
+      }
+    }
+    // If link present, append a parenthetical anchor as requested
+    if(it.link){
+      out += '<p>(<a href="'+escapeHtml(it.link)+'" target="_blank" rel="noopener noreferrer">odkaz zde</a>)</p>';
+    }
+    return out || '<p>Žádné nové užitečné informace.</p>';
   }
+
   document.querySelectorAll('.load-detail').forEach(btn=>{
-    btn.addEventListener('click', async ()=>{
-      const container = btn.closest('.detail-container');
-      const article = btn.closest('article.msg');
-      const uid = article.getAttribute('data-uid');
-      if(container.getAttribute('data-loaded')==='true'){
-        const details = container.querySelector('.details-rendered');
-        if(details) details.style.display = details.style.display === 'none' ? '' : 'none';
+    btn.addEventListener('click', (ev)=>{
+      var container = btn.closest('.detail-container');
+      var article = btn.closest('article.msg');
+      var uid = article.getAttribute('data-uid');
+      if(!window.PREFETCH) {
+        console.error('No PREFETCH data available');
+        btn.textContent = 'Chyba';
         return;
       }
-      btn.disabled = true; btn.textContent = 'Načítám…';
+      var data = window.PREFETCH[uid] || {overview:'', items:[]};
+      // Toggle: if already rendered, show/hide
+      if(container.getAttribute('data-loaded')==='true'){
+        var details = container.querySelector('.details-rendered');
+        if(details){
+          var isHidden = details.style.display === 'none';
+          details.style.display = isHidden ? '' : 'none';
+          btn.textContent = isHidden ? 'Sbalit' : 'Rozbalit';
+        }
+        return;
+      }
+
+      // Build details from PREFETCH (no network)
+      btn.disabled = true;
+      btn.textContent = 'Načítám…';
       try{
-        const resp = await fetch('messages/'+uid+'.json');
-        if(!resp.ok) throw new Error('Chyba při načítání detailu');
-        const data = await resp.json();
-        const wrapper = document.createElement('div'); wrapper.className='details-rendered';
-        (data.items||[]).forEach((it,idx)=>{
-          const sec = document.createElement('details');
-          const summ = document.createElement('summary');
-          summ.innerHTML = '<strong>'+escapeHtml(it.title)+'</strong> — <span style="color:#444">'+escapeHtml(it.summary)+'</span>';
-          sec.appendChild(summ);
-          const content = document.createElement('div'); content.style.padding='8px 0';
-          const grid = document.createElement('div');
-          grid.style.display='grid'; grid.style.gridTemplateColumns='1fr 2fr'; grid.style.gap='12px';
-          const left = document.createElement('div'); left.innerHTML = '<strong>'+escapeHtml(it.title)+'</strong>';
-          const right = document.createElement('div'); right.innerHTML = '<div style="color:#333">'+escapeHtml(it.summary)+'</div><div style="margin-top:8px"><a href="#" class="show-full" data-idx="'+idx+'">Zobrazit celý text</a></div>';
-          grid.appendChild(left); grid.appendChild(right);
-          content.appendChild(grid);
-          const full = document.createElement('div'); full.className='full-text hidden'; full.style.marginTop='8px'; full.style.borderTop='1px solid #eee'; full.style.paddingTop='8px';
-          full.innerHTML = renderFullTextHtml(it.full_text, it.link);
-          content.appendChild(full);
-          sec.appendChild(content);
-          wrapper.appendChild(sec);
-          right.querySelector('.show-full').addEventListener('click',(ev)=>{ ev.preventDefault(); full.classList.toggle('hidden'); });
-        });
+        var wrapper = document.createElement('div'); wrapper.className = 'details-rendered';
+        var items = data.items || [];
+        if(items.length===0){
+          wrapper.innerHTML = '<p>Žádné nové užitečné informace.</p>';
+        } else {
+          items.forEach(function(it, idx){
+            // header: title + short summary inline
+            var sec = document.createElement('details');
+            var summ = document.createElement('summary');
+            summ.innerHTML = '<strong>'+escapeHtml(it.title || '')+'</strong> — <span style="color:#444">'+escapeHtml(it.summary || '').slice(0,200)+'</span>';
+            sec.appendChild(summ);
+
+            var content = document.createElement('div'); content.style.padding='8px 0';
+            var full = document.createElement('div'); full.className='full-text hidden'; full.style.marginTop='8px'; full.style.borderTop='1px solid #eee'; full.style.paddingTop='8px';
+            // build paragraphs for summary and full_text (preferring summary)
+            full.innerHTML = renderItemHtml(it);
+            content.appendChild(full);
+
+            // add a small toggle link to show full
+            var linkDiv = document.createElement('div'); linkDiv.style.marginTop='8px';
+            var a = document.createElement('a'); a.href='#'; a.textContent = 'Zobrazit celý text';
+            a.style.cursor = 'pointer';
+            a.addEventListener('click', function(e){ e.preventDefault(); full.classList.toggle('hidden'); a.textContent = full.classList.contains('hidden') ? 'Zobrazit celý text' : 'Skrýt text'; });
+            linkDiv.appendChild(a);
+            content.appendChild(linkDiv);
+
+            sec.appendChild(content);
+            wrapper.appendChild(sec);
+          });
+        }
         container.appendChild(wrapper);
         container.setAttribute('data-loaded','true');
-        btn.textContent = 'Skrýt / zobrazit shrnutí';
+        btn.textContent = 'Sbalit';
       }catch(e){
-        console.error(e); btn.textContent='Chyba při načítání';
-      }finally{ btn.disabled=false; }
+        console.error(e);
+        btn.textContent = 'Chyba';
+      }finally{
+        btn.disabled = false;
+      }
     });
   });
 })();
@@ -221,6 +273,9 @@ def main():
     out_dir = Path("data"); out_dir.mkdir(parents=True, exist_ok=True)
     messages_dir = out_dir / "messages"; messages_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build PREFETCH map (safe JSON serializable)
+    prefetch_map = {}
+
     # summarization with cache; generate JSON + HTML per message
     for m in selected_sorted:
         raw_id = (m.get("message_id") or m.get("fallback_hash") or m.get("uid"))
@@ -244,18 +299,30 @@ def main():
         m["overview"] = summary_obj.get("overview") or ""
         m["_items"] = summary_obj.get("items") or []
 
-        # write JSON
+        # write JSON (per-message)
         j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": m["_items"], "overview": m["overview"] }
         (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
         # write simple HTML backup
-        html_template = Template("<!doctype html><html><head><meta charset='utf-8'><title>{{subject}}</title></head><body><h1>{{subject}}</h1><p><strong>From:</strong> {{frm}} • <strong>Date:</strong> {{date}} • <strong>Priority:</strong> P{{_priority}}</p><hr><h2>Stručné shrnutí</h2><p>{{overview}}</p><hr>{% for it in items %}<h3>{{it.title}}</h3><p>{{it.summary}}</p><pre>{{it.full_text}}</pre>{% endfor %}<hr><div>{{html|safe}}</div></body></html>")
-        rendered = html_template.render(subject=m.get("subject"), frm=m.get("from"), date=m.get("date"), _priority=m.get("_priority"), items=m["_items"], overview=m["overview"], html=m.get("html",""))
+        html_template = Template("<!doctype html><html><head><meta charset='utf-8'><title>{{subject}}</title></head><body><h1>{{subject}}</h1><p><strong>From:</strong> {{frm}} • <strong>Date:</strong> {{date}} • <strong>Priority:</strong> P{{_priority}}</p><hr><h2>Stručné shrnutí</h2>{% for it in items %}<h3>{{it.title}}</h3>{% for p in it.summary.split('\\n') %}<p>{{p}}</p>{% endfor %}<pre>{{it.full_text}}</pre>{% endfor %}<hr><div>{{html|safe}}</div></body></html>")
+        rendered = html_template.render(subject=m.get("subject"), frm=m.get("from"), date=m.get("date"), _priority=m[" _priority"] if False else m.get("_priority"), items=m["_items"], overview=m["overview"], html=m.get("html",""))
         (messages_dir / f"{safe_id}.html").write_text(rendered, encoding="utf-8")
 
-    # render index with period
+        # Add to PREFETCH map (ensure simple data)
+        safe_items = []
+        for it in m["_items"]:
+            safe_items.append({
+                "title": (it.get("title") or "")[:200],
+                "summary": (it.get("summary") or "")[:1000],
+                "full_text": (it.get("full_text") or "")[:4000],
+                "link": it.get("link")
+            })
+        prefetch_map[safe_id] = {"overview": m["overview"] or "", "items": safe_items}
+
+    # render index with period and PREFETCH JSON embedded
     index_t = Template(INDEX_TEMPLATE)
-    html = index_t.render(messages=selected_sorted, period_start=start_dt.date().isoformat(), period_end=end_dt.date().isoformat())
+    prefetch_json = json.dumps(prefetch_map, ensure_ascii=False)
+    html = index_t.render(messages=selected_sorted, period_start=start_dt.date().isoformat(), period_end=end_dt.date().isoformat(), prefetch_json=prefetch_json)
     (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
     logger.info("Generated %d messages. Digest saved to data/test_digest.html", len(selected_sorted))
 
