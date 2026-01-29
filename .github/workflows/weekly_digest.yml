@@ -29,31 +29,49 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies (if requirements exist)
+      - name: Ensure Python dependencies
         run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
           if [ -f data/requirements.txt ]; then
-            python -m pip install --upgrade pip
+            echo "Installing from data/requirements.txt"
             pip install -r data/requirements.txt
           elif [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
+            echo "Installing from requirements.txt"
             pip install -r requirements.txt
           else
-            echo "No requirements found — skipping pip install"
+            echo "No requirements file found — installing minimal runtime deps"
+            pip install beautifulsoup4 sumy nltk bleach jinja2
           fi
 
-          - name: Ensure Python dependencies
-  run: |
-    python -m pip install --upgrade pip
-    pip install beautifulsoup4 sumy nltk bleach jinja2
-    # ensure NLTK punkt is available
-    python - <<'PY'
-import nltk
+          # ensure NLTK punkt is available for sumy/tokenizers
+          python - <<'PY'
+import nltk, sys
 try:
     nltk.data.find('tokenizers/punkt')
-    print("NLTK punkt already installed")
+    print("NLTK: punkt already available")
 except Exception:
-    print("Downloading NLTK punkt")
+    print("NLTK: downloading punkt")
     nltk.download('punkt')
+PY
+
+      - name: Python debug info
+        run: |
+          set -euo pipefail
+          echo "which python:" && which python || true
+          echo "python -V:" && python -V || true
+          echo "python -m pip --version:" && python -m pip --version || true
+          echo "Installed packages (top):" && python -m pip list --format=columns | sed -n '1,200p' || true
+          echo "Quick import check:"
+          python - <<'PY' || true
+import sys
+mods = ["jinja2","bs4","sumy","nltk","bleach"]
+for m in mods:
+    try:
+        __import__(m)
+        print(m, "OK")
+    except Exception as e:
+        print(m, "IMPORT_FAILED:", e)
 PY
 
       - name: Run digest (auto-detect entrypoint)
@@ -72,6 +90,7 @@ PY
         run: |
           set -euo pipefail
           echo "Listing project root:" && ls -la
+          # Try common locations and names for a main script
           CANDIDATES="src/main.py main.py app.py newsletter/main.py"
           ENTRY=""
           for p in $CANDIDATES; do
@@ -80,6 +99,7 @@ PY
               break
             fi
           done
+          # Fallback: find any main.py in shallow tree
           if [ -z "$ENTRY" ]; then
             ENTRY=$(find . -maxdepth 3 -type f -name 'main.py' | head -n1 || true)
           fi
@@ -91,6 +111,7 @@ PY
           fi
           echo "Found entrypoint: $ENTRY"
           echo "Python sys.path:" && python -c "import sys; print('\\n'.join(sys.path))"
+          # Run as module if possible, otherwise run the script directly
           if python -m src.main >/dev/null 2>&1; then
             echo "Running as module: python -m src.main"
             python -m src.main
