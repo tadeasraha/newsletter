@@ -77,7 +77,7 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
   <div class="head">
     <div>
       <div class="title-row">
-        <div class="title">{{ m.subject }}{% if m._priority %} (P{{ m._priority }}){% endif %}</div>
+        <div class="title">{{ m.subject }}</div>
         {% if m._priority %}
           <span class="prio-square prio-{{ m._priority }}" title="Priority P{{ m._priority }}"></span>
         {% endif %}
