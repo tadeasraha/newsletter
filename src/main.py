@@ -85,7 +85,6 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
       <div class="meta">{{ m.from }} • {{ m.date }}</div>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
-      <!-- buttons swapped: Rozbalit first, then link -->
       <button class="load-detail">Rozbalit</button>
       <a class="link" href="messages/{{ m.safe_id }}.html" target="_blank">Otevřít celý e‑mail</a>
     </div>
@@ -96,8 +95,10 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
 </div>
 
 <script>
+/* PREFETCH contains raw_html for each message; injected server-side */
+window.PREFETCH = {{ prefetch_json | safe }};
+
 (function(){
-  // Priority filter UI
   function applyPriorityFilter(){
     var checked = Array.from(document.querySelectorAll('.prio-filter'))
       .filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
@@ -113,89 +114,16 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
   document.querySelectorAll('.prio-filter').forEach(function(cb){
     cb.addEventListener('change', applyPriorityFilter);
   });
-  applyPriorityFilter(); // initial
+  applyPriorityFilter();
 
-  // Robustní načítání iframe s fallbacky a debug logy
-  function tryLoadIframe(container, btn, uid){
-    const baseHref = (function(){
-      try {
-        const p = window.location.pathname;
-        return p.replace(/[^\/]*$/, '');
-      } catch(e){ return './'; }
-    })();
-
-    const candidates = [
-      'messages/' + uid + '.html',
-      './messages/' + uid + '.html',
-      baseHref + 'messages/' + uid + '.html',
-      'data/messages/' + uid + '.html',
-      './data/messages/' + uid + '.html',
-      baseHref + 'data/messages/' + uid + '.html'
-    ];
-
-    let i = 0;
-    function attemptNext(){
-      if(i >= candidates.length){
-        console.error('All iframe candidates failed for uid=' + uid, candidates);
-        btn.textContent = 'Chyba při načítání';
-        btn.disabled = false;
-        return;
-      }
-      const url = candidates[i++];
-      console.log('Trying iframe URL:', url);
-      const iframe = document.createElement('iframe');
-      iframe.className = 'msg-frame';
-      iframe.style.display = 'none';
-      iframe.src = url;
-      let loaded = false;
-      iframe.onload = function(){
-        try {
-          const doc = iframe.contentDocument || iframe.contentWindow.document;
-          const bodyText = (doc && doc.body && doc.body.textContent || '').trim();
-          // consider success if body has some text OR if cross-origin (can't read)
-          if(bodyText.length === 0){
-            // might still be ok (some files), but try heuristic: check HTTP status via src fetch not possible here
-            // treat as success if no error event fired (but we still proceed to show)
-          }
-          loaded = true;
-        } catch(e){
-          // cross-origin or access denied -> still ok if load event fired
-          loaded = true;
-        }
-        if(loaded){
-          iframe.style.display = '';
-          container.appendChild(iframe);
-          btn.textContent = 'Sbalit';
-          btn.disabled = false;
-          container.setAttribute('data-loaded','true');
-        } else {
-          iframe.remove();
-          attemptNext();
-        }
-      };
-      iframe.onerror = function(){
-        iframe.remove();
-        attemptNext();
-      };
-      // append hidden to DOM so load/onerror fire
-      container.appendChild(iframe);
-      setTimeout(function(){
-        if(!loaded){
-          try { iframe.remove(); } catch(e){}
-          attemptNext();
-        }
-      }, 3500);
-    }
-    attemptNext();
-  }
-
-  // Rozbalit: load full HTML into iframe (messages/<uid>.html) using robust loader
+  // on click: create iframe and set srcdoc from PREFETCH.raw_html (no external fetch)
   document.querySelectorAll('.load-detail').forEach(function(btn){
     btn.addEventListener('click', function(ev){
       var container = btn.closest('.detail-container');
       var article = btn.closest('article.msg');
       var uid = article.getAttribute('data-uid');
       if(!uid) return;
+      // toggle if already loaded
       if(container.getAttribute('data-loaded') === 'true'){
         var frame = container.querySelector('iframe.msg-frame');
         if(frame){
@@ -207,7 +135,30 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
       }
       btn.disabled = true;
       btn.textContent = 'Načítám…';
-      tryLoadIframe(container, btn, uid);
+      try {
+        var data = (window.PREFETCH && window.PREFETCH[uid]) || null;
+        var iframe = document.createElement('iframe');
+        iframe.className = 'msg-frame';
+        // Use srcdoc when available (embed HTML directly). Fallback to src if no prefetched HTML.
+        if(data && data.raw_html){
+          iframe.srcdoc = data.raw_html;
+          // show immediately
+          container.appendChild(iframe);
+          btn.textContent = 'Sbalit';
+          btn.disabled = false;
+          container.setAttribute('data-loaded','true');
+        } else {
+          // fallback to loading external file (if present)
+          iframe.src = 'messages/' + uid + '.html';
+          iframe.onload = function(){ btn.disabled = false; btn.textContent = 'Sbalit'; container.setAttribute('data-loaded','true'); };
+          iframe.onerror = function(){ btn.disabled = false; btn.textContent = 'Chyba při načítání'; };
+          container.appendChild(iframe);
+        }
+      } catch(e){
+        console.error(e);
+        btn.textContent = 'Chyba';
+        btn.disabled = false;
+      }
     });
   });
 })();
@@ -236,6 +187,7 @@ def save_cache(uid: str, data):
         logger.exception("Failed to write cache for uid=%s", uid)
 
 def sanitize_html(html_content: str) -> str:
+    # keep common tags but remove script tags to reduce risk
     cleaned = bleach.clean(html_content or "", tags=list(ALLOWED_TAGS), attributes=ALLOWED_ATTRIBUTES, protocols=ALLOWED_PROTOCOLS, strip=True)
     cleaned = re.sub(r'(?is)<script.*?>.*?</script>', '', cleaned)
     cleaned = re.sub(r'javascript:', '', cleaned, flags=re.IGNORECASE)
@@ -253,7 +205,7 @@ def get_week_window(now: Optional[datetime]=None):
 
 EXCLUDE_SUBJECT_PATTERNS = [
     r"confirm your subscription", r"confirm subscription", r"confirm email", r"verify your email",
-    r"verification", r"potvrď", r"ověř", r"ověřte", r"confirm", r"verify", r"action required", r"please confirm"
+    r"verification", r"potvr��", r"ověř", r"ověřte", r"confirm", r"verify", r"action required", r"please confirm"
 ]
 
 def subject_is_excluded(subject: str) -> bool:
@@ -303,7 +255,7 @@ def main():
         if pr is None: continue
         m["_priority"]=pr
         raw_html = m.get("html","") or ""
-        m["raw_html"] = raw_html
+        m["raw_html"] = raw_html  # keep raw for srcdoc embed
         m["html"] = sanitize_html(raw_html)
         try:
             m["date"] = m["date"].astimezone(timezone.utc).isoformat()
@@ -316,6 +268,8 @@ def main():
 
     out_dir = Path("data"); out_dir.mkdir(parents=True, exist_ok=True)
     messages_dir = out_dir / "messages"; messages_dir.mkdir(parents=True, exist_ok=True)
+
+    prefetch_map = {}
 
     for m in selected_sorted:
         raw_id = (m.get("message_id") or m.get("fallback_hash") or m.get("uid"))
@@ -338,9 +292,11 @@ def main():
         m["overview"] = summary_obj.get("overview") or ""
         m["_items"] = summary_obj.get("items") or []
 
+        # write JSON (per-message)
         j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": m["_items"], "overview": m["overview"] }
         (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
+        # write per-message HTML file (backup)
         raw_html = m.get("raw_html") or ""
         if raw_html.strip():
             msg_html = "<!doctype html><html><head><meta charset='utf-8'><title>{}</title></head><body>{}</body></html>".format(
@@ -352,11 +308,18 @@ def main():
             )
         (messages_dir / f"{safe_id}.html").write_text(msg_html, encoding="utf-8")
 
+        # add to prefetch map (embed raw_html for immediate display)
+        prefetch_map[safe_id] = {
+            "overview": m["overview"] or "",
+            "raw_html": msg_html
+        }
+
+    # render index (use DD/MM/YYYY format)
+    period_start = start_dt.strftime("%d/%m/%Y")
+    period_end = end_dt.strftime("%d/%m/%Y")
     index_t = Template(INDEX_TEMPLATE)
-# zobrazit období ve formátu DD/MM/YYYY (den/měsíc/rok)
-period_start = start_dt.strftime("%d/%m/%Y")
-period_end = end_dt.strftime("%d/%m/%Y")
-html = index_t.render(messages=selected_sorted, period_start=period_start, period_end=period_end)
+    prefetch_json = json.dumps(prefetch_map, ensure_ascii=False)
+    html = index_t.render(messages=selected_sorted, period_start=period_start, period_end=period_end, prefetch_json=prefetch_json)
     (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
     logger.info("Generated %d messages. Digest saved to data/test_digest.html", len(selected_sorted))
 
