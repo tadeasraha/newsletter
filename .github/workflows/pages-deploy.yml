@@ -1,0 +1,53 @@
+name: Publish site to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python (optional, only used if generator runs)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: (Optional) Build site by running generator if IMAP secrets are present
+        if: ${{ secrets.IMAP_HOST != '' && secrets.IMAP_USER != '' && secrets.IMAP_PASSWORD != '' }}
+        env:
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          PRIORITY_FILE: data/senders_priority.csv
+          CACHE_DIR: data/cache
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          # run generator which should produce data/test_digest.html and data/messages/*
+          python -m src.main
+
+      - name: Prepare site folder
+        run: |
+          # Ensure data exists
+          if [ ! -d data ]; then echo "No data/ directory found"; ls -la || true; fi
+          # Ensure index.html for Pages
+          if [ -f data/test_digest.html ]; then cp data/test_digest.html data/index.html; fi
+          ls -la data | sed -n '1,200p'
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./data
