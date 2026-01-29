@@ -41,6 +41,21 @@ jobs:
             echo "No requirements found — skipping pip install"
           fi
 
+          - name: Ensure Python dependencies
+  run: |
+    python -m pip install --upgrade pip
+    pip install beautifulsoup4 sumy nltk bleach jinja2
+    # ensure NLTK punkt is available
+    python - <<'PY'
+import nltk
+try:
+    nltk.data.find('tokenizers/punkt')
+    print("NLTK punkt already installed")
+except Exception:
+    print("Downloading NLTK punkt")
+    nltk.download('punkt')
+PY
+
       - name: Run digest (auto-detect entrypoint)
         env:
           IMAP_HOST: ${{ secrets.IMAP_HOST }}
