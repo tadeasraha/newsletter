@@ -2,12 +2,13 @@
 """
 Robust generator for newsletter digest.
 
-Behavior:
-- Only include senders present in PRIORITY_FILE (data/senders_priority.csv).
-- Always fetch last 7 days (start = now - 7d, end = now).
-- Produce per-message JSON with plain_text and sanitized HTML.
-- Embed base64 plain and base64 sanitized HTML into article attributes (|safe).
-- Client tries HTML first, then plain text, then JSON fallback.
+Features:
+- Always load last 7 days (start = now - 7d, end = now).
+- If sender not in priority map, assign default priority 3 (don't drop messages).
+- Robust date parsing/fallback to avoid crashes in sorting.
+- Write per-message JSON that includes plain_text and sanitized HTML for client fallback.
+- Embed base64 plain text and base64 sanitized HTML into data- attributes using Jinja |safe.
+- Client JS decodes base64, unescapes entities, or fetches messages/<uid>.json fallback.
 """
 import os
 import logging
@@ -33,7 +34,7 @@ PRIORITY_FILE = os.getenv("PRIORITY_FILE", "data/senders_priority.csv")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Allow tags/attributes useful for rendering sanitized HTML
+# allow tags to keep structure of emails
 ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
     "img", "table", "tr", "td", "th", "thead", "tbody", "tfoot", "style",
     "p", "br", "h1", "h2", "h3", "strong", "b", "em", "i", "ul", "ol", "li", "blockquote"
@@ -48,7 +49,7 @@ ALLOWED_ATTRIBUTES = {
 ALLOWED_PROTOCOLS = ["http", "https", "mailto", "data"]
 
 INDEX_TEMPLATE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Newsletter Hell</title>
+<html><head><meta charset="utf-8"><title>Newsletter Hell 1.0</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
@@ -79,7 +80,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 <div class="wrap">
   <div class="header header-main">
     <div>
-      <h1 class="site-title">Newsletter Hell</h1>
+      <h1 class="site-title">Newsletter Hell 1.0</h1>
       <div class="period">Období: {{ period_start }} — {{ period_end }}</div>
     </div>
     <div class="controls">
@@ -176,13 +177,13 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       if(!resp.ok) throw new Error('HTTP '+resp.status);
       return resp.json();
     }).then(function(obj){
+      var text = obj.plain_text || obj.overview || (obj.items && obj.items.map(function(it){ return it.summary || it.full_text || it.title; }).join('\\n\\n')) || '';
       if(obj.plain_html){
         var wrapperHtml2 = document.createElement('div');
         wrapperHtml2.className = 'plain-rendered msg-html';
         wrapperHtml2.innerHTML = obj.plain_html;
         container.appendChild(wrapperHtml2);
       } else {
-        var text = obj.plain_text || obj.overview || (obj.items && obj.items.map(function(it){ return it.summary || it.full_text || it.title; }).join('\\n\\n')) || '';
         var parts2 = text.split(/\\n{2,}|\\r\\n{2,}/).map(function(p){ return p.trim(); }).filter(Boolean);
         var wrapper2 = document.createElement('div'); wrapper2.className = 'plain-rendered';
         if(parts2.length === 0){
@@ -242,7 +243,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 </body></html>
 """
 
-# Helpers and processing logic
+# helpers and processing logic
 TECHNICAL_PATTERNS = [
     r'(?i)nezobrazuje se vám newsletter správně',
     r'(?i)if you are having trouble viewing this email',
@@ -351,9 +352,6 @@ def main():
         return
 
     priority_map = load_priority_map(PRIORITY_FILE)
-    if not priority_map:
-        logger.error("Priority map not found or empty: %s", PRIORITY_FILE)
-        return
     logger.info("Loaded %d priority entries (file: %s)", len(priority_map), PRIORITY_FILE)
 
     # ALWAYS last 7 days up to now
@@ -384,8 +382,7 @@ def main():
                 continue
             pr = get_priority_for_sender(m.get("from",""), priority_map)
             if pr is None:
-                # original behavior: skip messages whose sender is not in priority map
-                continue
+                pr = 3
             m["_priority"] = int(pr)
             raw_html = m.get("html","") or ""
             m["raw_html"] = raw_html
