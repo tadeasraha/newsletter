@@ -29,7 +29,7 @@ ALLOWED_ATTRIBUTES = {
 ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
 
 INDEX_TEMPLATE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Týdenní výběr newsletterů</title>
+<html><head><meta charset="utf-8"><title>Newsletter</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:18px;background:#f6f7fb;color:#111}
@@ -48,10 +48,10 @@ a.link{color:#1a73e8}
 </style></head><body>
 <div class="wrap">
   <div class="header">
-    <h1>Týdenní výběr newsletterů</h1>
+    <h1>Newsletter Hell 1.0</h1>
     <div class="period">Období: {{ period_start }} — {{ period_end }}</div>
   </div>
-  <p class="small">Zobrazeny všechny newslettery z vašeho priority seznamu za zvolené období. Kliknutím načtěte rozšířené shrnutí (lazy load).</p>
+    <p class="small">Zobrazeny všechny newslettery z uvedeného týdne. Klikni na <strong>Rozbalit</strong> pro zobrazení shrnutí.</p>
 {% for m in messages %}
 <article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}">
   <div class="head">
