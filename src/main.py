@@ -85,8 +85,9 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
       <div class="meta">{{ m.from }} • {{ m.date }}</div>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
-      <a class="link" href="messages/{{ m.safe_id }}.html" target="_blank">Otevřít celý e‑mail</a>
+      <!-- buttons swapped: Rozbalit first, then link -->
       <button class="load-detail">Rozbalit</button>
+      <a class="link" href="messages/{{ m.safe_id }}.html" target="_blank">Otevřít celý e‑mail</a>
     </div>
   </div>
   <div class="detail-container" data-loaded="false"></div>
@@ -102,7 +103,6 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
       .filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
     document.querySelectorAll('article.msg').forEach(function(article){
       var p = article.getAttribute('data-priority') || '';
-      // treat empty as show
       if(p && checked.indexOf(p) === -1){
         article.style.display = 'none';
       } else {
@@ -115,14 +115,87 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
   });
   applyPriorityFilter(); // initial
 
-  // Rozbalit: load full HTML into iframe (messages/<uid>.html)
+  // Robustní načítání iframe s fallbacky a debug logy
+  function tryLoadIframe(container, btn, uid){
+    const baseHref = (function(){
+      try {
+        const p = window.location.pathname;
+        return p.replace(/[^\/]*$/, '');
+      } catch(e){ return './'; }
+    })();
+
+    const candidates = [
+      'messages/' + uid + '.html',
+      './messages/' + uid + '.html',
+      baseHref + 'messages/' + uid + '.html',
+      'data/messages/' + uid + '.html',
+      './data/messages/' + uid + '.html',
+      baseHref + 'data/messages/' + uid + '.html'
+    ];
+
+    let i = 0;
+    function attemptNext(){
+      if(i >= candidates.length){
+        console.error('All iframe candidates failed for uid=' + uid, candidates);
+        btn.textContent = 'Chyba při načítání';
+        btn.disabled = false;
+        return;
+      }
+      const url = candidates[i++];
+      console.log('Trying iframe URL:', url);
+      const iframe = document.createElement('iframe');
+      iframe.className = 'msg-frame';
+      iframe.style.display = 'none';
+      iframe.src = url;
+      let loaded = false;
+      iframe.onload = function(){
+        try {
+          const doc = iframe.contentDocument || iframe.contentWindow.document;
+          const bodyText = (doc && doc.body && doc.body.textContent || '').trim();
+          // consider success if body has some text OR if cross-origin (can't read)
+          if(bodyText.length === 0){
+            // might still be ok (some files), but try heuristic: check HTTP status via src fetch not possible here
+            // treat as success if no error event fired (but we still proceed to show)
+          }
+          loaded = true;
+        } catch(e){
+          // cross-origin or access denied -> still ok if load event fired
+          loaded = true;
+        }
+        if(loaded){
+          iframe.style.display = '';
+          container.appendChild(iframe);
+          btn.textContent = 'Sbalit';
+          btn.disabled = false;
+          container.setAttribute('data-loaded','true');
+        } else {
+          iframe.remove();
+          attemptNext();
+        }
+      };
+      iframe.onerror = function(){
+        iframe.remove();
+        attemptNext();
+      };
+      // append hidden to DOM so load/onerror fire
+      container.appendChild(iframe);
+      setTimeout(function(){
+        if(!loaded){
+          try { iframe.remove(); } catch(e){}
+          attemptNext();
+        }
+      }, 3500);
+    }
+    attemptNext();
+  }
+
+  // Rozbalit: load full HTML into iframe (messages/<uid>.html) using robust loader
   document.querySelectorAll('.load-detail').forEach(function(btn){
     btn.addEventListener('click', function(ev){
       var container = btn.closest('.detail-container');
       var article = btn.closest('article.msg');
       var uid = article.getAttribute('data-uid');
       if(!uid) return;
-      // toggle if already loaded
       if(container.getAttribute('data-loaded') === 'true'){
         var frame = container.querySelector('iframe.msg-frame');
         if(frame){
@@ -132,21 +205,9 @@ iframe.msg-frame{width:100%;min-height:480px;border:1px solid #ddd;border-radius
         }
         return;
       }
-      // load iframe
       btn.disabled = true;
       btn.textContent = 'Načítám…';
-      try {
-        var iframe = document.createElement('iframe');
-        iframe.className = 'msg-frame';
-        iframe.src = 'messages/' + uid + '.html';
-        iframe.onload = function(){ btn.disabled = false; btn.textContent = 'Sbalit'; container.setAttribute('data-loaded','true'); };
-        iframe.onerror = function(){ btn.disabled = false; btn.textContent = 'Chyba při načítání'; };
-        container.appendChild(iframe);
-      } catch(e){
-        console.error(e);
-        btn.textContent = 'Chyba';
-        btn.disabled = false;
-      }
+      tryLoadIframe(container, btn, uid);
     });
   });
 })();
@@ -175,9 +236,7 @@ def save_cache(uid: str, data):
         logger.exception("Failed to write cache for uid=%s", uid)
 
 def sanitize_html(html_content: str) -> str:
-    # Keep common tags but remove scripts/on* attributes to reduce XSS risk
     cleaned = bleach.clean(html_content or "", tags=list(ALLOWED_TAGS), attributes=ALLOWED_ATTRIBUTES, protocols=ALLOWED_PROTOCOLS, strip=True)
-    # remove script tags leftover and javascript: links
     cleaned = re.sub(r'(?is)<script.*?>.*?</script>', '', cleaned)
     cleaned = re.sub(r'javascript:', '', cleaned, flags=re.IGNORECASE)
     return cleaned
@@ -243,11 +302,9 @@ def main():
         pr = get_priority_for_sender(m.get("from",""), priority_map)
         if pr is None: continue
         m["_priority"]=pr
-        # preserve raw html for faithful rendering, but also keep a sanitized variant
         raw_html = m.get("html","") or ""
         m["raw_html"] = raw_html
         m["html"] = sanitize_html(raw_html)
-        # ensure date is isoformat string
         try:
             m["date"] = m["date"].astimezone(timezone.utc).isoformat()
         except Exception:
@@ -260,7 +317,6 @@ def main():
     out_dir = Path("data"); out_dir.mkdir(parents=True, exist_ok=True)
     messages_dir = out_dir / "messages"; messages_dir.mkdir(parents=True, exist_ok=True)
 
-    # generate per-message files (raw html) and JSON summary
     for m in selected_sorted:
         raw_id = (m.get("message_id") or m.get("fallback_hash") or m.get("uid"))
         safe_id = safe_id_for(raw_id)
@@ -272,7 +328,6 @@ def main():
         else:
             try:
                 summary_obj = extract_items_from_message(m.get("subject",""), m.get("from",""), m.get("text",""), m.get("html",""), safe_id)
-                # filter boilerplate items
                 items = [it for it in summary_obj.get("items", []) if not re.search(r"(?i)view in browser|unsubscribe|manage your subscription|preferences", (it.get("full_text") or "") + " " + (it.get("summary") or ""))]
                 summary_obj["items"] = items
             except Exception as e:
@@ -283,25 +338,20 @@ def main():
         m["overview"] = summary_obj.get("overview") or ""
         m["_items"] = summary_obj.get("items") or []
 
-        # write JSON (per-message)
         j = { "subject": m.get("subject"), "from": m.get("from"), "date": m.get("date"), "priority": m.get("_priority"), "items": m["_items"], "overview": m["overview"] }
         (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
-        # write the full/faithful HTML for the message using raw_html when available
         raw_html = m.get("raw_html") or ""
         if raw_html.strip():
-            # wrap raw HTML in a simple shell so it can be opened directly
             msg_html = "<!doctype html><html><head><meta charset='utf-8'><title>{}</title></head><body>{}</body></html>".format(
                 (m.get("subject") or "").replace("</","</"), raw_html
             )
         else:
-            # fallback: use sanitized html or plain text
             msg_html = "<!doctype html><html><head><meta charset='utf-8'><title>{}</title></head><body><h1>{}</h1><pre style='white-space:pre-wrap;'>{}</pre></body></html>".format(
                 (m.get("subject") or ""), (m.get("subject") or ""), (m.get("text") or "")
             )
         (messages_dir / f"{safe_id}.html").write_text(msg_html, encoding="utf-8")
 
-    # render index
     index_t = Template(INDEX_TEMPLATE)
     html = index_t.render(messages=selected_sorted, period_start=start_dt.date().isoformat(), period_end=end_dt.date().isoformat())
     (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
