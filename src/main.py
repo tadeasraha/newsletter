@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Robust generator for newsletter digest.
+Generator digestu — robustní verze s debugem pro priority filtering a čitelným plain renderem.
 
-Behavior:
-- Only include senders present in PRIORITY_FILE (data/senders_priority.csv).
-- Always fetch last 7 days (start = now - 7d, end = now).
-- Produce per-message JSON with plain_text and sanitized HTML.
-- Embed base64 plain and base64 sanitized HTML into article attributes (|safe).
-- Client tries HTML first, then plain text, then JSON fallback.
+Hlavní vlastnosti:
+- Strict filtering: include only senders listed in data/senders_priority.csv (exact email or domain).
+- Window: always last 7 days (now - 7d .. now).
+- For each selected message produce:
+  - plain_text (cleaned)
+  - plain_render_html (wrapped readable HTML from plain text)
+  - plain_html (sanitized original HTML)
+  - base64 variants: plain_b64, plain_render_b64, plain_html_b64 embedded into <article> attributes (|safe)
+  - messages/<uid>.json includes plain_text/plain_render_html/plain_html for fallback
+- Writes data/debug_selection.json with per-message decision details to help debugging.
+- Client-side JS uses robust decoding and robust initialization (works even if DOMContentLoaded already fired).
 """
 import os
 import logging
@@ -15,15 +20,16 @@ import json
 import re
 import hashlib
 import base64
+import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from jinja2 import Template
 from typing import Optional, Dict, Any, List
 from bs4 import BeautifulSoup
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, parseaddr
 from src.fetch import fetch_messages_since
 from src.summarize import extract_items_from_message
-from src.filter import load_priority_map, get_priority_for_sender
+from src.filter import load_priority_map
 import bleach
 
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +38,11 @@ logger = logging.getLogger(__name__)
 PRIORITY_FILE = os.getenv("PRIORITY_FILE", "data/senders_priority.csv")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_DIR = Path("data")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+MESSAGES_DIR = OUT_DIR / "messages"
+MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Allow tags/attributes useful for rendering sanitized HTML
 ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
@@ -51,7 +62,7 @@ INDEX_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Newsletter Hell</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
 .wrap{max-width:1100px;margin:0 auto}
 .header{margin-bottom:28px;display:flex;justify-content:space-between;align-items:center}
 .period{color:#666;font-size:0.95rem;margin-bottom:0}
@@ -70,11 +81,12 @@ a.link{color:#1a73e8}
 .prio-1{background:#e53935}
 .prio-2{background:#fb8c00}
 .prio-3{background:#43a047}
-.plain-paragraph{margin:10px 0;line-height:1.6;color:#222}
+.plain-paragraph{margin:10px 0;line-height:1.6;color:#222;white-space:pre-wrap}
 .msg-html{font-family:inherit;color:inherit}
 .msg-html img{max-width:100%;height:auto}
 .header-main{margin-bottom:18px}
 h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
+.debug-small{font-size:0.8rem;color:#999;margin-left:8px}
 </style></head><body>
 <div class="wrap">
   <div class="header header-main">
@@ -90,8 +102,13 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
     </div>
   </div>
 
+  <div class="debug">
+    <small class="debug-small">Generated messages: {{ messages|length }}</small>
+  </div>
+
 {% for m in messages %}
-<article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}" data-plain='{{ m.plain_b64|safe }}' data-plain-html='{{ m.plain_html_b64|safe }}' data-plain-len="{{ (m.plain_b64|default(''))|length }}">
+<article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}"
+         data-plain='{{ m.plain_b64|safe }}' data-plain-render='{{ m.plain_render_b64|safe }}' data-plain-html='{{ m.plain_html_b64|safe }}'>
   <div class="head">
     <div>
       <div class="title-row">
@@ -100,7 +117,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
           <span class="prio-square prio-{{ m._priority }}" title="Priority P{{ m._priority }}"></span>
         {% endif %}
       </div>
-      <div class="meta">{{ m.from }} • {{ m.date }}</div>
+      <div class="meta">{{ m.from }} • {{ m.date }} <span class="debug-small">uid: {{ m.safe_id[:8] }}</span></div>
     </div>
     <div style="display:flex;gap:8px;align-items:center"></div>
   </div>
@@ -112,6 +129,30 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 
 <script>
 (function(){
+  // robust base64 -> utf8
+  function base64ToUtf8(b64){
+    if(!b64) return null;
+    if(b64.indexOf('&') !== -1){
+      try { var ta = document.createElement('textarea'); ta.innerHTML = b64; b64 = ta.value; } catch(e){ /* ignore */ }
+    }
+    try {
+      var bin = atob(b64);
+    } catch(e){
+      return null;
+    }
+    try {
+      if(typeof TextDecoder !== 'undefined'){
+        var arr = new Uint8Array(bin.length);
+        for(var i=0;i<bin.length;i++){ arr[i]=bin.charCodeAt(i); }
+        return new TextDecoder('utf-8').decode(arr);
+      } else {
+        return decodeURIComponent(escape(bin));
+      }
+    } catch(e){
+      try { return decodeURIComponent(escape(bin)); } catch(_) { return bin; }
+    }
+  }
+
   function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"']/g, function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];}); }
 
   function renderPlainForArticle(article){
@@ -127,34 +168,33 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       return;
     }
 
-    // Try sanitized HTML first (preferred)
-    var htmlB64 = article.getAttribute('data-plain-html') || '';
-    if(htmlB64){
-      if(htmlB64.indexOf('&') !== -1){
-        try { var ta2 = document.createElement('textarea'); ta2.innerHTML = htmlB64; htmlB64 = ta2.value; } catch(e){ console.warn('unescape html_b64 failed', e); }
-      }
-      try {
-        var htmlDecoded = decodeURIComponent(escape(window.atob(htmlB64)));
-        var wrapperHtml = document.createElement('div');
-        wrapperHtml.className = 'plain-rendered msg-html';
-        wrapperHtml.innerHTML = htmlDecoded;
-        container.appendChild(wrapperHtml);
-        container.setAttribute('data-loaded','true');
-        return;
-      } catch(e){
-        console.warn('html base64 decode failed', e);
-      }
+    // 1) prefer formatted plain render
+    var renderB64 = article.getAttribute('data-plain-render') || '';
+    var renderHtml = base64ToUtf8(renderB64);
+    if(renderHtml){
+      var wrapper = document.createElement('div'); wrapper.className = 'plain-rendered msg-html';
+      wrapper.innerHTML = renderHtml;
+      container.appendChild(wrapper);
+      container.setAttribute('data-loaded','true');
+      console.log('rendered plain_render for', article.getAttribute('data-uid'));
+      return;
     }
 
-    // Then try plain text
+    // 2) sanitized original HTML
+    var htmlB64 = article.getAttribute('data-plain-html') || '';
+    var htmlDecoded = base64ToUtf8(htmlB64);
+    if(htmlDecoded){
+      var wrapperHtml = document.createElement('div'); wrapperHtml.className = 'plain-rendered msg-html';
+      wrapperHtml.innerHTML = htmlDecoded;
+      container.appendChild(wrapperHtml);
+      container.setAttribute('data-loaded','true');
+      console.log('rendered plain_html for', article.getAttribute('data-uid'));
+      return;
+    }
+
+    // 3) simple plain text
     var b64 = article.getAttribute('data-plain') || '';
-    if(b64 && b64.indexOf('&') !== -1){
-      try { var ta = document.createElement('textarea'); ta.innerHTML = b64; b64 = ta.value; } catch(e){ console.warn('unescape failed', e); }
-    }
-    var plain = '';
-    if(b64){
-      try { plain = decodeURIComponent(escape(window.atob(b64))); } catch(e){ plain = ''; }
-    }
+    var plain = base64ToUtf8(b64);
     if(plain){
       var parts = plain.split(/\n{2,}|\r\n{2,}/).map(function(p){ return p.trim(); }).filter(Boolean);
       var wrapper = document.createElement('div'); wrapper.className = 'plain-rendered';
@@ -165,49 +205,56 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       }
       container.appendChild(wrapper);
       container.setAttribute('data-loaded','true');
+      console.log('rendered plain_text for', article.getAttribute('data-uid'));
       return;
     }
 
-    // Fallback: fetch per-message JSON
+    // 4) fallback fetch
     var uid = article.getAttribute('data-uid');
     if(!uid) return;
     var url = 'messages/' + uid + '.json';
+    console.log('fetch fallback JSON', url);
     fetch(url).then(function(resp){
       if(!resp.ok) throw new Error('HTTP '+resp.status);
       return resp.json();
     }).then(function(obj){
-      if(obj.plain_html){
-        var wrapperHtml2 = document.createElement('div');
-        wrapperHtml2.className = 'plain-rendered msg-html';
-        wrapperHtml2.innerHTML = obj.plain_html;
-        container.appendChild(wrapperHtml2);
+      if(obj.plain_render_html){
+        var w = document.createElement('div'); w.className='plain-rendered msg-html'; w.innerHTML = obj.plain_render_html; container.appendChild(w);
+      } else if(obj.plain_html){
+        var w2 = document.createElement('div'); w2.className='plain-rendered msg-html'; w2.innerHTML = obj.plain_html; container.appendChild(w2);
       } else {
         var text = obj.plain_text || obj.overview || (obj.items && obj.items.map(function(it){ return it.summary || it.full_text || it.title; }).join('\\n\\n')) || '';
         var parts2 = text.split(/\\n{2,}|\\r\\n{2,}/).map(function(p){ return p.trim(); }).filter(Boolean);
-        var wrapper2 = document.createElement('div'); wrapper2.className = 'plain-rendered';
-        if(parts2.length === 0){
-          wrapper2.innerHTML = '<p class="plain-paragraph">Žádné nové užitečné informace.</p>';
-        } else {
-          wrapper2.innerHTML = parts2.map(function(p){ return '<p class="plain-paragraph">' + escapeHtml(p) + '</p>'; }).join('');
-        }
-        container.appendChild(wrapper2);
+        var w3 = document.createElement('div'); w3.className='plain-rendered';
+        w3.innerHTML = parts2.map(function(p){ return '<p class="plain-paragraph">' + escapeHtml(p) + '</p>'; }).join('');
+        container.appendChild(w3);
       }
       container.setAttribute('data-loaded','true');
     }).catch(function(err){
       console.error('Fallback fetch failed', err);
-      var wrapper = document.createElement('div'); wrapper.className = 'plain-rendered';
+      var wrapper = document.createElement('div'); wrapper.className='plain-rendered';
       wrapper.innerHTML = '<p class="plain-paragraph">Nelze načíst obsah (fallback selhal).</p>';
       container.appendChild(wrapper);
       container.setAttribute('data-loaded','true');
     });
   }
 
+  // attach handlers robustly (supports late load)
   function attachTitleHandlers(){
-    document.querySelectorAll('.title[role="button"]').forEach(function(el){
-      el.addEventListener('click', function(ev){
-        var article = el.closest('article.msg');
-        if(article) renderPlainForArticle(article);
+    // try delegation first (safe)
+    if(!attachTitleHandlers._delegationAttached){
+      document.addEventListener('click', function(e){
+        var t = e.target.closest && e.target.closest('.title[role="button"]');
+        if(t){
+          var article = t.closest('article.msg');
+          if(article) renderPlainForArticle(article);
+        }
       });
+      attachTitleHandlers._delegationAttached = true;
+    }
+    // also attach per-element handlers for keyboard accessibility
+    document.querySelectorAll('.title[role="button"]').forEach(function(el){
+      if(el._hasKey) return;
       el.addEventListener('keydown', function(ev){
         if(ev.key === 'Enter' || ev.key === ' '){
           ev.preventDefault();
@@ -215,34 +262,52 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
           if(article) renderPlainForArticle(article);
         }
       });
+      el._hasKey = true;
     });
   }
 
   function applyPriorityFilter(){
     var checked = Array.from(document.querySelectorAll('.prio-filter')).filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
+    console.log('applyPriorityFilter: checked', checked);
+    var cnt=0;
     document.querySelectorAll('article.msg').forEach(function(article){
       var p = article.getAttribute('data-priority') || '';
       if(p && checked.indexOf(p) === -1){
         article.style.display = 'none';
       } else {
         article.style.display = '';
+        cnt++;
       }
     });
+    console.log('applyPriorityFilter: visible articles=', cnt);
   }
 
-  document.addEventListener('DOMContentLoaded', function(){
-    attachTitleHandlers();
-    document.querySelectorAll('.prio-filter').forEach(function(cb){
-      cb.addEventListener('change', applyPriorityFilter);
-    });
-    applyPriorityFilter();
-  });
+  function init(){
+    try{
+      attachTitleHandlers();
+      document.querySelectorAll('.prio-filter').forEach(function(cb){
+        cb.addEventListener('change', applyPriorityFilter);
+      });
+      applyPriorityFilter();
+    }catch(e){
+      console.error('init error', e);
+    }
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    // DOM already parsed — init immediately
+    init();
+  }
+
 })();
 </script>
 </body></html>
 """
 
-# Helpers and processing logic
+# ---- helper functions below ----
+
 TECHNICAL_PATTERNS = [
     r'(?i)nezobrazuje se vám newsletter správně',
     r'(?i)if you are having trouble viewing this email',
@@ -263,8 +328,7 @@ def _strip_technical(text: str) -> str:
     useful = []
     for ln in lines:
         if not ln: continue
-        if len(ln) < 10:
-            continue
+        if len(ln) < 10: continue
         if re.search(r'(?i)(unsubscribe|odhlásit|preferences|manage your subscription|privacy policy|view in browser|zobrazit v prohlížeči)', ln):
             continue
         useful.append(ln)
@@ -283,6 +347,24 @@ def html_to_plain_text(html: str, fallback: str = "") -> str:
     t = _strip_technical(t)
     t = re.sub(r'\n{3,}', '\n\n', t).strip()
     return t
+
+def format_plain_for_display(plain_text: str, width: int = 84) -> str:
+    if not plain_text:
+        return '<div class="msg-html"><p class="plain-paragraph">Žádné nové užitečné informace.</p></div>'
+    parts = re.split(r'\n{2,}|\r\n{2,}', plain_text)
+    out_parts = []
+    for p in parts:
+        p = p.strip()
+        if not p: continue
+        p = re.sub(r'\n+', ' ', p)
+        p = re.sub(r'[ \t]{2,}', ' ', p)
+        try:
+            wrapped = textwrap.fill(p, width=width)
+        except Exception:
+            wrapped = p
+        esc = wrapped.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&#39;')
+        out_parts.append(f'<p class="plain-paragraph">{esc}</p>')
+    return '<div class="msg-html">' + ''.join(out_parts) + '</div>'
 
 def safe_id_for(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8", errors="ignore")).hexdigest()
@@ -356,7 +438,22 @@ def main():
         return
     logger.info("Loaded %d priority entries (file: %s)", len(priority_map), PRIORITY_FILE)
 
-    # ALWAYS last 7 days up to now
+    # build exact/domain maps
+    exact_map: Dict[str,int] = {}
+    domain_map: Dict[str,int] = {}
+    for k,v in priority_map.items():
+        kk = (k or "").strip().lower()
+        try:
+            pv = int(v)
+        except Exception:
+            continue
+        if '@' in kk:
+            exact_map[kk] = pv
+        elif kk:
+            domain_map[kk] = pv
+    logger.info("Priority exact entries: %d, domain entries: %d", len(exact_map), len(domain_map))
+
+    # window last 7 days
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     start_dt = now - timedelta(days=7)
     end_dt = now
@@ -365,61 +462,89 @@ def main():
     msgs = fetch_messages_since(IMAP_HOST, IMAP_USER, IMAP_PASSWORD, start_dt, mailbox="INBOX")
     logger.info("IMAP candidates: %d", len(msgs))
 
-    seen = set(); unique: List[Dict[str, Any]] = []
+    seen = set(); unique: List[Dict[str,Any]] = []
     for m in msgs:
         mid = (m.get("message_id") or "").strip()
         key = mid if mid else m.get("fallback_hash") or m.get("uid")
-        if not key:
-            continue
+        if not key: continue
         if key in seen: continue
         seen.add(key); unique.append(m)
     logger.info("After dedupe: %d", len(unique))
 
-    selected: List[Dict[str, Any]] = []
+    debug_selection = []
+
+    selected: List[Dict[str,Any]] = []
     for m in unique:
         try:
+            entry = {"subject": m.get("subject"), "from": m.get("from"), "uid": m.get("uid") or m.get("message_id")}
             if not m.get("is_newsletter"):
-                continue
+                entry["reason"]="not_newsletter"; debug_selection.append(entry); continue
             if subject_is_excluded(m.get("subject","")):
-                continue
-            pr = get_priority_for_sender(m.get("from",""), priority_map)
+                entry["reason"]="subject_excluded"; debug_selection.append(entry); continue
+
+            from_header = m.get("from","") or ""
+            _, sender_email = parseaddr(from_header)
+            sender_email = (sender_email or "").strip().lower()
+            if not sender_email:
+                entry["reason"]="no_sender_email"; debug_selection.append(entry); continue
+
+            pr = None
+            if sender_email in exact_map:
+                pr = exact_map[sender_email]; entry["matched"]="exact"
+            else:
+                try:
+                    domain = sender_email.split('@',1)[1]
+                except Exception:
+                    domain = ""
+                if domain and domain in domain_map:
+                    pr = domain_map[domain]; entry["matched"]="domain"
             if pr is None:
-                # original behavior: skip messages whose sender is not in priority map
-                continue
+                entry["reason"]="not_in_priority_map"; debug_selection.append(entry); continue
+
             m["_priority"] = int(pr)
+            entry["priority"]=m["_priority"]
+
             raw_html = m.get("html","") or ""
-            m["raw_html"] = raw_html
-            m["html"] = sanitize_html(raw_html)
+            m["raw_html"]=raw_html
+            m["html"]=sanitize_html(raw_html)
+
             dt_val = m.get("date") or m.get("internal_date") or None
             ts = parse_date_to_ts(dt_val)
             if ts == 0:
                 ts = int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp())
-            m["_date_ts"] = ts
+            m["_date_ts"]=ts
             try:
                 if isinstance(dt_val, datetime):
-                    m["date"] = dt_val.astimezone(timezone.utc).isoformat()
+                    m["date"]=dt_val.astimezone(timezone.utc).isoformat()
                 elif isinstance(dt_val, str):
-                    m["date"] = dt_val
+                    m["date"]=dt_val
                 else:
-                    m["date"] = datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).isoformat()
+                    m["date"]=datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).isoformat()
             except Exception:
-                m["date"] = str(dt_val or "")
+                m["date"]=str(dt_val or "")
+
             selected.append(m)
+            entry["included"]=True
+            debug_selection.append(entry)
         except Exception:
             logger.exception("Skipping message during selection: %s", m.get("subject"))
 
+    # write debug selection
+    try:
+        (OUT_DIR / "debug_selection.json").write_text(json.dumps(debug_selection, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("Wrote debug_selection.json with %d entries", len(debug_selection))
+    except Exception:
+        logger.exception("Failed to write debug_selection.json")
+
     logger.info("Selected by priority & newsletter filter: %d", len(selected))
 
-    # sort by priority asc, then newest first
-    selected_sorted = sorted(selected, key=lambda x: (x.get("_priority", 999), -int(x.get("_date_ts", 0))))
-
-    out_dir = Path("data"); out_dir.mkdir(parents=True, exist_ok=True)
-    messages_dir = out_dir / "messages"; messages_dir.mkdir(parents=True, exist_ok=True)
+    # sort by priority asc then newest first
+    selected_sorted = sorted(selected, key=lambda x: (x.get("_priority",999), -int(x.get("_date_ts",0))))
 
     for m in selected_sorted:
         raw_id = (m.get("message_id") or m.get("fallback_hash") or m.get("uid") or "")
         safe_id = safe_id_for(raw_id)
-        m["safe_id"] = safe_id
+        m["safe_id"]=safe_id
 
         cached = load_cache(safe_id)
         if cached is not None:
@@ -428,25 +553,34 @@ def main():
             try:
                 summary_obj = extract_items_from_message(m.get("subject",""), m.get("from",""), m.get("text",""), m.get("html",""), safe_id)
                 items = [it for it in summary_obj.get("items", []) if not re.search(r"(?i)view in browser|unsubscribe|manage your subscription|preferences", (it.get("full_text") or "") + " " + (it.get("summary") or ""))]
-                summary_obj["items"] = items
+                summary_obj["items"]=items
             except Exception as e:
                 logger.exception("Summarize failed uid=%s: %s", safe_id, e)
-                summary_obj = {"overview": "", "items": []}
+                summary_obj={"overview":"","items":[]}
             save_cache(safe_id, summary_obj)
 
-        m["overview"] = summary_obj.get("overview") or ""
-        m["_items"] = summary_obj.get("items") or []
+        m["overview"]=summary_obj.get("overview") or ""
+        m["_items"]=summary_obj.get("items") or []
 
-        # create plain text (cleaned) and base64 encode
         raw_html = m.get("raw_html") or ""
         plain = html_to_plain_text(raw_html or m.get("text","") or "")
         try:
             b64 = base64.b64encode(plain.encode("utf-8")).decode("ascii")
         except Exception:
             b64 = ""
-        m["plain_b64"] = b64
+        m["plain_b64"]=b64
 
-        # create sanitized HTML version and base64 encode it
+        # plain_render_html (formatted plain text)
+        try:
+            render_html = format_plain_for_display(plain)
+            render_b64 = base64.b64encode(render_html.encode("utf-8")).decode("ascii")
+        except Exception:
+            render_html = ""
+            render_b64 = ""
+        m["plain_render_html"]=render_html
+        m["plain_render_b64"]=render_b64
+
+        # sanitized HTML fallback
         try:
             sanitized_html = sanitize_html(raw_html or "")
             sanitized_html_wrapped = f'<div class="msg-html">{sanitized_html}</div>'
@@ -454,9 +588,10 @@ def main():
         except Exception:
             sanitized_html_wrapped = ""
             html_b64 = ""
-        m["plain_html_b64"] = html_b64
+        m["plain_html"]=sanitized_html_wrapped
+        m["plain_html_b64"]=html_b64
 
-        # write per-message JSON (include plain_text and plain_html as fallback)
+        # write per-message JSON
         j = {
             "subject": m.get("subject"),
             "from": m.get("from"),
@@ -465,11 +600,12 @@ def main():
             "items": m["_items"],
             "overview": m["overview"],
             "plain_text": plain,
-            "plain_html": sanitized_html_wrapped
+            "plain_html": sanitized_html_wrapped,
+            "plain_render_html": render_html
         }
-        (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
+        (MESSAGES_DIR / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
-        # write per-message HTML file as backup
+        # per-message html backup
         if raw_html.strip():
             try:
                 msg_html = "<!doctype html><html><head><meta charset='utf-8'><title>{}</title></head><body>{}</body></html>".format(
@@ -483,14 +619,14 @@ def main():
             msg_html = "<!doctype html><html><head><meta charset='utf-8'><title>{}</title></head><body><h1>{}</h1><pre style='white-space:pre-wrap;'>{}</pre></body></html>".format(
                 (m.get("subject") or ""), (m.get("subject") or ""), (m.get("text") or "")
             )
-        (messages_dir / f"{safe_id}.html").write_text(msg_html, encoding="utf-8")
+        (MESSAGES_DIR / f"{safe_id}.html").write_text(msg_html, encoding="utf-8")
 
     # render index
     period_start = start_dt.strftime("%d/%m/%Y")
     period_end = end_dt.strftime("%d/%m/%Y")
     index_t = Template(INDEX_TEMPLATE)
     html = index_t.render(messages=selected_sorted, period_start=period_start, period_end=period_end)
-    (out_dir / "test_digest.html").write_text(html, encoding="utf-8")
+    (OUT_DIR / "test_digest.html").write_text(html, encoding="utf-8")
     logger.info("Generated %d messages. Digest saved to data/test_digest.html", len(selected_sorted))
 
 if __name__ == "__main__":
