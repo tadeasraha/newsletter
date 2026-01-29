@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generator digestu — fokus: čitelný plain-text preview + strict priority filtering.
+Robust generator for newsletter digest.
 
-- Only include senders listed in data/senders_priority.csv (error and exit if missing/empty).
-- Window always last 7 days (now - 7d .. now).
-- For each message produce: plain_text, plain_render_html (wrapped readable HTML), plain_html (sanitized original HTML).
-- Embed base64 variants into <article> attributes (Jinja |safe).
-- Client tries: plain_render_html -> plain_html -> plain_text -> messages/<uid>.json.
-- Robust base64 -> UTF-8 decoding using TextDecoder where available.
+Behavior:
+- Only include senders present in PRIORITY_FILE (data/senders_priority.csv).
+- Always fetch last 7 days (start = now - 7d, end = now).
+- Produce per-message JSON with plain_text and sanitized HTML.
+- Embed base64 plain and base64 sanitized HTML into article attributes (|safe).
+- Client tries HTML first, then plain text, then JSON fallback.
 """
 import os
 import logging
@@ -15,7 +15,6 @@ import json
 import re
 import hashlib
 import base64
-import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from jinja2 import Template
@@ -34,25 +33,25 @@ PRIORITY_FILE = os.getenv("PRIORITY_FILE", "data/senders_priority.csv")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Allowed tags/attrs for sanitized HTML (server-side bleach)
+# Allow tags/attributes useful for rendering sanitized HTML
 ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
-    "img","table","tr","td","th","thead","tbody","tfoot","style",
-    "p","br","h1","h2","h3","strong","b","em","i","ul","ol","li","blockquote"
+    "img", "table", "tr", "td", "th", "thead", "tbody", "tfoot", "style",
+    "p", "br", "h1", "h2", "h3", "strong", "b", "em", "i", "ul", "ol", "li", "blockquote"
 }
 ALLOWED_ATTRIBUTES = {
     **bleach.sanitizer.ALLOWED_ATTRIBUTES,
-    "img": ["src","alt","title","width","height","loading"],
-    "a": ["href","title","rel","target"],
-    "td": ["colspan","rowspan"],
-    "th": ["colspan","rowspan"],
+    "img": ["src", "alt", "title", "width", "height", "loading"],
+    "a": ["href", "title", "rel", "target"],
+    "td": ["colspan", "rowspan"],
+    "th": ["colspan", "rowspan"],
 }
-ALLOWED_PROTOCOLS = ["http","https","mailto","data"]
+ALLOWED_PROTOCOLS = ["http", "https", "mailto", "data"]
 
 INDEX_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Newsletter Hell</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
+body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial;margin:0;padding:36px 18px;background:#f6f7fb;color:#111}
 .wrap{max-width:1100px;margin:0 auto}
 .header{margin-bottom:28px;display:flex;justify-content:space-between;align-items:center}
 .period{color:#666;font-size:0.95rem;margin-bottom:0}
@@ -71,12 +70,11 @@ a.link{color:#1a73e8}
 .prio-1{background:#e53935}
 .prio-2{background:#fb8c00}
 .prio-3{background:#43a047}
-.plain-paragraph{margin:10px 0;line-height:1.6;color:#222;white-space:pre-wrap}
+.plain-paragraph{margin:10px 0;line-height:1.6;color:#222}
 .msg-html{font-family:inherit;color:inherit}
 .msg-html img{max-width:100%;height:auto}
 .header-main{margin-bottom:18px}
 h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
-.debug-small{font-size:0.8rem;color:#999;margin-left:8px}
 </style></head><body>
 <div class="wrap">
   <div class="header header-main">
@@ -93,8 +91,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
   </div>
 
 {% for m in messages %}
-<article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}"
-         data-plain='{{ m.plain_b64|safe }}' data-plain-render='{{ m.plain_render_b64|safe }}' data-plain-html='{{ m.plain_html_b64|safe }}'>
+<article class="msg" id="m-{{ m.safe_id }}" data-uid="{{ m.safe_id }}" data-priority="{{ m._priority }}" data-plain='{{ m.plain_b64|safe }}' data-plain-html='{{ m.plain_html_b64|safe }}' data-plain-len="{{ (m.plain_b64|default(''))|length }}">
   <div class="head">
     <div>
       <div class="title-row">
@@ -103,7 +100,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
           <span class="prio-square prio-{{ m._priority }}" title="Priority P{{ m._priority }}"></span>
         {% endif %}
       </div>
-      <div class="meta">{{ m.from }} • {{ m.date }} <span class="debug-small">uid: {{ m.safe_id[:8] }}</span></div>
+      <div class="meta">{{ m.from }} • {{ m.date }}</div>
     </div>
     <div style="display:flex;gap:8px;align-items:center"></div>
   </div>
@@ -116,32 +113,6 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 <script>
 (function(){
   function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"']/g, function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];}); }
-
-  function base64ToUtf8(b64){
-    if(!b64) return null;
-    // unescape HTML-escaped base64 if needed
-    if(b64.indexOf('&') !== -1){
-      try { var ta = document.createElement('textarea'); ta.innerHTML = b64; b64 = ta.value; } catch(e){ /* ignore */ }
-    }
-    try {
-      var bin = atob(b64);
-    } catch(e){
-      return null;
-    }
-    // decode UTF-8 bytes -> string
-    try {
-      if(typeof TextDecoder !== 'undefined'){
-        var arr = new Uint8Array(bin.length);
-        for(var i=0;i<bin.length;i++){ arr[i]=bin.charCodeAt(i); }
-        return new TextDecoder().decode(arr);
-      } else {
-        // fallback
-        try { return decodeURIComponent(escape(bin)); } catch(e){ return bin; }
-      }
-    } catch(e){
-      try { return decodeURIComponent(escape(bin)); } catch(e){ return bin; }
-    }
-  }
 
   function renderPlainForArticle(article){
     var container = article.querySelector('.detail-container');
@@ -156,35 +127,34 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       return;
     }
 
-    // 1) formatted plain render HTML (preferred)
-    var renderB64 = article.getAttribute('data-plain-render') || '';
-    var renderHtml = base64ToUtf8(renderB64);
-    if(renderHtml){
-      var wrapper = document.createElement('div');
-      wrapper.className = 'plain-rendered msg-html';
-      wrapper.innerHTML = renderHtml;
-      container.appendChild(wrapper);
-      container.setAttribute('data-loaded','true');
-      console.log('rendered plain_render_html for', article.getAttribute('data-uid'));
-      return;
-    }
-
-    // 2) sanitized HTML (server-side sanitized)
+    // Try sanitized HTML first (preferred)
     var htmlB64 = article.getAttribute('data-plain-html') || '';
-    var htmlDecoded = base64ToUtf8(htmlB64);
-    if(htmlDecoded){
-      var wrapperHtml = document.createElement('div');
-      wrapperHtml.className = 'plain-rendered msg-html';
-      wrapperHtml.innerHTML = htmlDecoded;
-      container.appendChild(wrapperHtml);
-      container.setAttribute('data-loaded','true');
-      console.log('rendered plain_html for', article.getAttribute('data-uid'));
-      return;
+    if(htmlB64){
+      if(htmlB64.indexOf('&') !== -1){
+        try { var ta2 = document.createElement('textarea'); ta2.innerHTML = htmlB64; htmlB64 = ta2.value; } catch(e){ console.warn('unescape html_b64 failed', e); }
+      }
+      try {
+        var htmlDecoded = decodeURIComponent(escape(window.atob(htmlB64)));
+        var wrapperHtml = document.createElement('div');
+        wrapperHtml.className = 'plain-rendered msg-html';
+        wrapperHtml.innerHTML = htmlDecoded;
+        container.appendChild(wrapperHtml);
+        container.setAttribute('data-loaded','true');
+        return;
+      } catch(e){
+        console.warn('html base64 decode failed', e);
+      }
     }
 
-    // 3) simple plain text
+    // Then try plain text
     var b64 = article.getAttribute('data-plain') || '';
-    var plain = base64ToUtf8(b64);
+    if(b64 && b64.indexOf('&') !== -1){
+      try { var ta = document.createElement('textarea'); ta.innerHTML = b64; b64 = ta.value; } catch(e){ console.warn('unescape failed', e); }
+    }
+    var plain = '';
+    if(b64){
+      try { plain = decodeURIComponent(escape(window.atob(b64))); } catch(e){ plain = ''; }
+    }
     if(plain){
       var parts = plain.split(/\n{2,}|\r\n{2,}/).map(function(p){ return p.trim(); }).filter(Boolean);
       var wrapper = document.createElement('div'); wrapper.className = 'plain-rendered';
@@ -195,29 +165,22 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
       }
       container.appendChild(wrapper);
       container.setAttribute('data-loaded','true');
-      console.log('rendered plain_text for', article.getAttribute('data-uid'));
       return;
     }
 
-    // 4) fallback: fetch per-message JSON
+    // Fallback: fetch per-message JSON
     var uid = article.getAttribute('data-uid');
     if(!uid) return;
     var url = 'messages/' + uid + '.json';
-    console.log('fetch fallback JSON', url);
     fetch(url).then(function(resp){
       if(!resp.ok) throw new Error('HTTP '+resp.status);
       return resp.json();
     }).then(function(obj){
-      if(obj.plain_render_html){
+      if(obj.plain_html){
         var wrapperHtml2 = document.createElement('div');
         wrapperHtml2.className = 'plain-rendered msg-html';
-        wrapperHtml2.innerHTML = obj.plain_render_html;
+        wrapperHtml2.innerHTML = obj.plain_html;
         container.appendChild(wrapperHtml2);
-      } else if(obj.plain_html){
-        var wrapperHtml3 = document.createElement('div');
-        wrapperHtml3.className = 'plain-rendered msg-html';
-        wrapperHtml3.innerHTML = obj.plain_html;
-        container.appendChild(wrapperHtml3);
       } else {
         var text = obj.plain_text || obj.overview || (obj.items && obj.items.map(function(it){ return it.summary || it.full_text || it.title; }).join('\\n\\n')) || '';
         var parts2 = text.split(/\\n{2,}|\\r\\n{2,}/).map(function(p){ return p.trim(); }).filter(Boolean);
@@ -257,10 +220,7 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
 
   function applyPriorityFilter(){
     var checked = Array.from(document.querySelectorAll('.prio-filter')).filter(cb=>cb.checked).map(cb=>cb.getAttribute('data-prio'));
-    console.log('applyPriorityFilter: checked', checked);
-    var articles = document.querySelectorAll('article.msg');
-    console.log('applyPriorityFilter: articles count', articles.length);
-    articles.forEach(function(article){
+    document.querySelectorAll('article.msg').forEach(function(article){
       var p = article.getAttribute('data-priority') || '';
       if(p && checked.indexOf(p) === -1){
         article.style.display = 'none';
@@ -270,27 +230,19 @@ h1.site-title{font-size:2.2rem;margin:0 0 10px 0}
     });
   }
 
-  function init(){
+  document.addEventListener('DOMContentLoaded', function(){
     attachTitleHandlers();
     document.querySelectorAll('.prio-filter').forEach(function(cb){
       cb.addEventListener('change', applyPriorityFilter);
     });
     applyPriorityFilter();
-  }
-
-  if(document.readyState === 'loading'){
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
-
+  });
 })();
 </script>
 </body></html>
 """
 
-# ---- helpers and processing logic below ----
-
+# Helpers and processing logic
 TECHNICAL_PATTERNS = [
     r'(?i)nezobrazuje se vám newsletter správně',
     r'(?i)if you are having trouble viewing this email',
@@ -323,7 +275,7 @@ def html_to_plain_text(html: str, fallback: str = "") -> str:
         t = fallback
     else:
         try:
-            t = BeautifulSoup(html or "", "html.parser").get_text(separator="\n\n")
+            t = BeautifulSoup(html or "", "html.parser").get_text(separator="\n")
         except Exception:
             t = fallback or ""
     t = re.sub(r'\r\n', '\n', t)
@@ -331,25 +283,6 @@ def html_to_plain_text(html: str, fallback: str = "") -> str:
     t = _strip_technical(t)
     t = re.sub(r'\n{3,}', '\n\n', t).strip()
     return t
-
-def format_plain_for_display(plain_text: str, width: int = 84) -> str:
-    if not plain_text:
-        return '<div class="msg-html"><p class="plain-paragraph">Žádné nové užitečné informace.</p></div>'
-    parts = re.split(r'\n{2,}|\r\n{2,}', plain_text)
-    out_parts = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        p = re.sub(r'\n+', ' ', p)
-        p = re.sub(r'[ \t]{2,}', ' ', p)
-        try:
-            wrapped = textwrap.fill(p, width=width)
-        except Exception:
-            wrapped = p
-        esc = (wrapped.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&#39;'))
-        out_parts.append(f'<p class="plain-paragraph">{esc}</p>')
-    return '<div class="msg-html">' + ''.join(out_parts) + '</div>'
 
 def safe_id_for(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8", errors="ignore")).hexdigest()
@@ -423,7 +356,7 @@ def main():
         return
     logger.info("Loaded %d priority entries (file: %s)", len(priority_map), PRIORITY_FILE)
 
-    # ALWAYS last 7 days
+    # ALWAYS last 7 days up to now
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     start_dt = now - timedelta(days=7)
     end_dt = now
@@ -504,7 +437,7 @@ def main():
         m["overview"] = summary_obj.get("overview") or ""
         m["_items"] = summary_obj.get("items") or []
 
-        # create plain text (cleaned)
+        # create plain text (cleaned) and base64 encode
         raw_html = m.get("raw_html") or ""
         plain = html_to_plain_text(raw_html or m.get("text","") or "")
         try:
@@ -513,17 +446,7 @@ def main():
             b64 = ""
         m["plain_b64"] = b64
 
-        # create formatted plain render HTML (for readable plain-text display) and base64 encode
-        try:
-            render_html = format_plain_for_display(plain)
-            render_b64 = base64.b64encode(render_html.encode("utf-8")).decode("ascii")
-        except Exception:
-            render_html = ""
-            render_b64 = ""
-        m["plain_render_html"] = render_html
-        m["plain_render_b64"] = render_b64
-
-        # create sanitized HTML version and base64 encode it as additional fallback
+        # create sanitized HTML version and base64 encode it
         try:
             sanitized_html = sanitize_html(raw_html or "")
             sanitized_html_wrapped = f'<div class="msg-html">{sanitized_html}</div>'
@@ -531,10 +454,9 @@ def main():
         except Exception:
             sanitized_html_wrapped = ""
             html_b64 = ""
-        m["plain_html"] = sanitized_html_wrapped
         m["plain_html_b64"] = html_b64
 
-        # write per-message JSON (include plain_text and plain_html and render HTML as fallback)
+        # write per-message JSON (include plain_text and plain_html as fallback)
         j = {
             "subject": m.get("subject"),
             "from": m.get("from"),
@@ -543,8 +465,7 @@ def main():
             "items": m["_items"],
             "overview": m["overview"],
             "plain_text": plain,
-            "plain_html": sanitized_html_wrapped,
-            "plain_render_html": render_html
+            "plain_html": sanitized_html_wrapped
         }
         (messages_dir / f"{safe_id}.json").write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
 
